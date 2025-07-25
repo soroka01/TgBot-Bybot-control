@@ -1,0 +1,13 @@
+__pycache__/
+bot.log
+.log
+*.log
+/logs/
+logs/
+*.tmp
+*.temp
+.env
+*.env
+config.py
+*token*
+*key*

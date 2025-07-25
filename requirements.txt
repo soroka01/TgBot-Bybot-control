@@ -1,0 +1,9 @@
+aiogram==3.0.0b7
+requests==2.31.0
+python-dotenv==1.0.0
+schedule==1.2.0
+pytz==2023.3
+matplotlib==3.9.2
+numpy==2.1.2
+pyTelegramBotAPI==4.23.0
+pybit==5.7.0
