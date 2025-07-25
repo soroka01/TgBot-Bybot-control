@@ -6,6 +6,8 @@ bot.log
 logs/
 *.tmp
 *.temp
+.venv
+venv/
 .env
 *.env
 config.py
