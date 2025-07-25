@@ -1,10 +1,13 @@
-from telebot import types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from logs.logging_config import logging
 
 def create_markup(buttons):
-    markup = types.InlineKeyboardMarkup()
+    """Создать разметку клавиатуры из списка кнопок"""
+    markup = InlineKeyboardMarkup(inline_keyboard=[])
     for button in buttons:
-        markup.add(types.InlineKeyboardButton(button["text"], callback_data=button["callback_data"]))
+        markup.inline_keyboard.append([
+            InlineKeyboardButton(text=button["text"], callback_data=button["callback_data"])
+        ])
     return markup
 
 def create_back_button(menu):

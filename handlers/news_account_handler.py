@@ -1,12 +1,21 @@
 """
-Обработчики для новостей и аккаунта
+Обработчики для новостей и информации об аккаунте
 """
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
 from handlers.base_handler import BaseHandler
 from services.news_service import news_service
 from services.database_service import db_service
-from services.trading_service import trading_service
-from buttons import create_account_menu, create_back_button
+from buttons import create_back_button, create_account_menu
 from core.decorators import handle_errors
+from core.factories import bot_factory
+
+class AccountStates(StatesGroup):
+    """Состояния для процесса изменения имени"""
+    waiting_for_name = State()
 
 class NewsAndAccountHandler(BaseHandler):
     """Обработчик новостей и информации об аккаунте"""
@@ -15,102 +24,108 @@ class NewsAndAccountHandler(BaseHandler):
         super().__init__()
         self.news_service = news_service
         self.db_service = db_service
-        self.trading_service = trading_service
+        self.router = Router()
+        self.dp = bot_factory.get_dispatcher()
     
     def register_handlers(self):
         """Регистрация обработчиков"""
         
-        @self.bot.callback_query_handler(func=lambda call: call.data == "news")
+        @self.router.callback_query(F.data == "news")
         @handle_errors("Ошибка получения новостей")
-        def handle_news(call):
+        async def handle_news(call: CallbackQuery):
             user_id = self.get_user_id(call)
             message_id = self.get_message_id(call)
             
-            self._send_news(user_id, message_id)
+            await self._send_news(user_id, message_id)
+            await call.answer()
         
-        @self.bot.callback_query_handler(func=lambda call: call.data == "account")
+        @self.router.callback_query(F.data == "account")
         @handle_errors("Ошибка получения информации об аккаунте")
-        def handle_account(call):
+        async def handle_account(call: CallbackQuery):
             user_id = self.get_user_id(call)
             message_id = self.get_message_id(call)
             
-            self._send_account_info(user_id, message_id)
+            await self._send_account_info(user_id, message_id)
+            await call.answer()
         
-        @self.bot.callback_query_handler(func=lambda call: call.data == "back_to_account")
+        @self.router.callback_query(F.data == "back_to_account")
         @handle_errors("Ошибка возврата в аккаунт")
-        def handle_back_to_account(call):
+        async def handle_back_to_account(call: CallbackQuery, state: FSMContext):
             user_id = self.get_user_id(call)
             message_id = self.get_message_id(call)
             
-            self._send_account_info(user_id, message_id)
+            # Очищаем состояние
+            await state.clear()
+            
+            await self._send_account_info(user_id, message_id)
+            await call.answer()
         
-        @self.bot.callback_query_handler(func=lambda call: call.data == "change_name")
+        @self.router.callback_query(F.data == "change_name")
         @handle_errors("Ошибка изменения имени")
-        def handle_change_name(call):
+        async def handle_change_name(call: CallbackQuery, state: FSMContext):
             user_id = self.get_user_id(call)
             message_id = self.get_message_id(call)
             
-            self._start_name_change(user_id, message_id)
+            await self._start_name_change(user_id, message_id, state)
+            await call.answer()
+        
+        @self.router.message(AccountStates.waiting_for_name)
+        @handle_errors("Ошибка обработки нового имени")
+        async def process_name_change(message: Message, state: FSMContext):
+            await self._process_name_change(message, state)
+        
+        # Регистрируем роутер в диспетчере
+        self.dp.include_router(self.router)
     
-    @handle_errors("Ошибка получения новостей")
-    def _send_news(self, user_id: int, message_id: int):
-        """Отправить новости"""
+    @handle_errors("Ошибка отправки новостей")
+    async def _send_news(self, user_id: int, message_id: int):
+        """Отправить новости пользователю"""
         try:
-            # Получаем новости и краткую сводку рынка
-            news = self.news_service.get_latest_crypto_news()
-            market_summary = self.news_service.get_market_summary()
+            news_data = self.news_service.get_latest_crypto_news()
             
-            full_news = f"{news}\n\n{market_summary}"
+            if news_data:
+                news_message = f"📰 Последние новости о криптовалютах:\n\n{news_data}"
+            else:
+                news_message = "📭 Новости временно недоступны"
             
-            self.edit_message_safely(
+            await self.edit_message_safely(
                 user_id,
                 message_id,
-                full_news,
+                news_message,
                 create_back_button("menu")
             )
             
         except Exception as e:
             error_message = f"⚠️ Ошибка при получении новостей: {str(e)}"
-            self.edit_message_safely(
+            await self.edit_message_safely(
                 user_id,
                 message_id,
                 error_message,
                 create_back_button("menu")
             )
     
-    @handle_errors("Ошибка получения информации об аккаунте")
-    def _send_account_info(self, user_id: int, message_id: int):
+    @handle_errors("Ошибка отправки информации об аккаунте")
+    async def _send_account_info(self, user_id: int, message_id: int):
         """Отправить информацию об аккаунте"""
         try:
             # Получаем данные пользователя
-            user_data = self.db_service.get(user_id)
+            user_data = self.db_service.get_user_data(user_id)
             user_name = user_data.get("name", "Не установлено")
             
-            # Получаем баланс
-            try:
-                btc_balance, usdt_balance = self.trading_service.get_balance()
-                balance_info = (
-                    f"💰 Баланс:\n"
-                    f"₿ BTC: {btc_balance}\n"
-                    f"💵 USDT: {usdt_balance}"
-                )
-            except Exception as e:
-                balance_info = f"⚠️ Ошибка получения баланса: {str(e)}"
-            
             # Получаем статистику алертов
-            price_alerts = self.db_service.get_user_alerts(user_id, "price_alerts")
-            rsi_alerts = self.db_service.get_user_alerts(user_id, "rsi_alerts")
+            alert_stats = self.db_service.get_user_alert_stats(user_id)
             
             account_message = (
-                f"👤 Информация об аккаунте\n\n"
+                f"👤 Информация об аккаунте:\n\n"
                 f"🆔 ID: {user_id}\n"
-                f"👤 Имя: {user_name}\n"
-                f"🔔 Ценовых алертов: {len(price_alerts)}\n"
-                f"📊 RSI алертов: {len(rsi_alerts)}\n\n"
-                f"{balance_info}"
+                f"👨‍💼 Имя: {user_name}\n"
+                f"🔔 Активных алертов: {alert_stats.get('total', 0)}\n"
+                f"  • Ценовых: {alert_stats.get('price_alerts', 0)}\n"
+                f"  • RSI: {alert_stats.get('rsi_alerts', 0)}\n"
+                f"📅 Дата регистрации: {user_data.get('created_at', 'Неизвестно')}"
             )
             
-            self.edit_message_safely(
+            await self.edit_message_safely(
                 user_id,
                 message_id,
                 account_message,
@@ -119,70 +134,68 @@ class NewsAndAccountHandler(BaseHandler):
             
         except Exception as e:
             error_message = f"⚠️ Ошибка при получении информации об аккаунте: {str(e)}"
-            self.edit_message_safely(
+            await self.edit_message_safely(
                 user_id,
                 message_id,
                 error_message,
                 create_back_button("menu")
             )
     
-    def _start_name_change(self, user_id: int, message_id: int):
-        """Начать процесс смены имени"""
+    async def _start_name_change(self, user_id: int, message_id: int, state: FSMContext):
+        """Начать процесс изменения имени"""
         message_text = (
-            "✏️ Введите новое имя:\n\n"
-            "💡 Имя будет отображаться в информации об аккаунте"
+            "✏️ Изменение имени\n\n"
+            "Введите новое имя пользователя:"
         )
         
-        self.edit_message_safely(
+        await self.edit_message_safely(
             user_id,
             message_id,
             message_text,
             create_back_button("account")
         )
         
-        self.bot.register_next_step_handler_by_chat_id(
-            user_id,
-            self._process_name_change
-        )
+        await state.set_state(AccountStates.waiting_for_name)
     
-    @handle_errors("Ошибка изменения имени")
-    def _process_name_change(self, message):
+    async def _process_name_change(self, message: Message, state: FSMContext):
         """Обработать изменение имени"""
         user_id = self.get_user_id(message)
         new_name = message.text.strip()
         
-        if not new_name or len(new_name) > 50:
-            error_message = "⚠️ Имя должно содержать от 1 до 50 символов"
-            self.send_message_safely(
-                user_id,
-                error_message,
-                create_back_button("account")
-            )
-            return
-        
         try:
-            # Получаем текущие данные пользователя
-            user_data = self.db_service.get(user_id)
-            user_data["name"] = new_name
+            if len(new_name) < 2:
+                raise ValueError("Имя должно содержать минимум 2 символа")
             
-            # Сохраняем обновленные данные
-            success = self.db_service.save(user_id, user_data)
+            if len(new_name) > 50:
+                raise ValueError("Имя не должно превышать 50 символов")
+            
+            # Сохраняем новое имя
+            success = self.db_service.update_user_name(user_id, new_name)
             
             if success:
                 success_message = f"✅ Имя успешно изменено на: {new_name}"
             else:
-                success_message = "⚠️ Ошибка при сохранении имени"
+                success_message = "⚠️ Не удалось изменить имя. Попробуйте позже."
             
-            self.send_message_safely(
+            await self.send_message_safely(
                 user_id,
                 success_message,
                 create_back_button("account")
             )
             
-        except Exception as e:
-            error_message = f"⚠️ Ошибка при изменении имени: {str(e)}"
-            self.send_message_safely(
+        except ValueError as e:
+            error_message = f"⚠️ {str(e)}"
+            await self.send_message_safely(
                 user_id,
                 error_message,
                 create_back_button("account")
             )
+        except Exception as e:
+            error_message = f"⚠️ Ошибка при изменении имени: {str(e)}"
+            await self.send_message_safely(
+                user_id,
+                error_message,
+                create_back_button("account")
+            )
+        finally:
+            await state.clear()

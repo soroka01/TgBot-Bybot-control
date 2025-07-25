@@ -1,6 +1,7 @@
 """
 Главное приложение с улучшенной архитектурой
 """
+import asyncio
 import signal
 import sys
 import time
@@ -24,6 +25,7 @@ class TelegramBot:
         self.handler_manager = handler_manager
         self.task_service = task_service
         self.bot = None
+        self.dp = None
         self._running = False
         
         # Настройка обработки сигналов для корректного завершения
@@ -33,10 +35,10 @@ class TelegramBot:
     def _signal_handler(self, signum, frame):
         """Обработчик сигналов для корректного завершения"""
         self.logger.info(f"Получен сигнал {signum}, завершение работы...")
-        self.stop()
+        asyncio.create_task(self.stop())
         sys.exit(0)
     
-    def initialize(self):
+    async def initialize(self):
         """Инициализация всех компонентов"""
         try:
             self.logger.info("=== Инициализация Telegram Bot ===")
@@ -49,6 +51,7 @@ class TelegramBot:
             self.logger.info("Регистрация обработчиков...")
             self.handler_manager.register_all_handlers()
             self.bot = self.handler_manager.get_bot()
+            self.dp = self.handler_manager.get_dispatcher()
             
             if not self.bot:
                 raise Exception("Не удалось получить экземпляр бота")
@@ -64,9 +67,9 @@ class TelegramBot:
             self.logger.error(f"Ошибка инициализации: {e}")
             return False
     
-    def start(self):
+    async def start(self):
         """Запуск бота"""
-        if not self.initialize():
+        if not await self.initialize():
             self.logger.error("Не удалось инициализировать бот")
             return False
         
@@ -84,17 +87,17 @@ class TelegramBot:
             self._running = True
             
             # Отправка уведомления о запуске администраторам
-            self._send_startup_notification()
+            await self._send_startup_notification()
             
             # Запуск polling
-            self.bot.polling(none_stop=True, interval=1, timeout=20)
+            await self.dp.start_polling(self.bot)
             
         except Exception as e:
             self.logger.error(f"Ошибка запуска бота: {e}")
-            self.stop()
+            await self.stop()
             return False
     
-    def stop(self):
+    async def stop(self):
         """Остановка бота"""
         if not self._running:
             return
@@ -108,19 +111,19 @@ class TelegramBot:
             self.task_service.stop_scheduler()
             
             # Отправка уведомления об остановке
-            self._send_shutdown_notification()
+            await self._send_shutdown_notification()
             
             # Остановка бота
             if self.bot:
                 self.logger.info("Остановка Telegram бота...")
-                self.bot.stop_polling()
+                await self.bot.session.close()
             
             self.logger.info("=== Бот остановлен ===")
             
         except Exception as e:
             self.logger.error(f"Ошибка при остановке бота: {e}")
     
-    def _send_startup_notification(self):
+    async def _send_startup_notification(self):
         """Отправить уведомление о запуске бота"""
         try:
             message = (
@@ -133,14 +136,14 @@ class TelegramBot:
             
             for admin_id in config.TG_IDS[:1]:  # Отправляем только первому админу
                 try:
-                    self.bot.send_message(admin_id, message)
+                    await self.bot.send_message(admin_id, message)
                 except Exception as e:
                     self.logger.warning(f"Не удалось отправить уведомление о запуске пользователю {admin_id}: {e}")
                     
         except Exception as e:
             self.logger.error(f"Ошибка отправки уведомления о запуске: {e}")
     
-    def _send_shutdown_notification(self):
+    async def _send_shutdown_notification(self):
         """Отправить уведомление об остановке бота"""
         try:
             message = (
@@ -150,7 +153,7 @@ class TelegramBot:
             
             for admin_id in config.TG_IDS[:1]:  # Отправляем только первому админу
                 try:
-                    self.bot.send_message(admin_id, message)
+                    await self.bot.send_message(admin_id, message)
                 except Exception as e:
                     self.logger.warning(f"Не удалось отправить уведомление об остановке пользователю {admin_id}: {e}")
                     
@@ -171,7 +174,7 @@ class TelegramBot:
             }
         }
 
-def main():
+async def main():
     """Главная функция"""
     try:
         # Создание и запуск бота
@@ -186,7 +189,7 @@ def main():
         logger.info(f"Максимум алертов на пользователя: {config.MAX_ALERTS_PER_USER}")
         
         # Запуск
-        success = bot_app.start()
+        success = await bot_app.start()
         
         if not success:
             logger.error("Не удалось запустить бота")
@@ -202,5 +205,5 @@ def main():
         return 1
 
 if __name__ == '__main__':
-    exit_code = main()
+    exit_code = asyncio.run(main())
     sys.exit(exit_code)

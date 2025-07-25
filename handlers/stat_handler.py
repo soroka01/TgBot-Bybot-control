@@ -1,11 +1,15 @@
 """
 Обработчики для статистики и рыночных данных
 """
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+
 from handlers.base_handler import BaseHandler
 from services.market_service import market_service
 from buttons import create_back_button
 from core.decorators import handle_errors
 from core.config import config
+from core.factories import bot_factory
 
 class StatHandler(BaseHandler):
     """Обработчик статистики и рыночных данных"""
@@ -13,24 +17,30 @@ class StatHandler(BaseHandler):
     def __init__(self):
         super().__init__()
         self.market_service = market_service
+        self.router = Router()
+        self.dp = bot_factory.get_dispatcher()
     
     def register_handlers(self):
         """Регистрация обработчиков"""
         
-        @self.bot.callback_query_handler(func=lambda call: call.data == "stat")
+        @self.router.callback_query(F.data == "stat")
         @handle_errors("Ошибка получения статистики")
-        def handle_stat_callback(call):
+        async def handle_stat_callback(call: CallbackQuery):
             user_id = self.get_user_id(call)
-            self._send_statistics(user_id)
+            await self._send_statistics(user_id)
+            await call.answer()
         
-        @self.bot.message_handler(func=lambda message: message.text == "📊 Стата")
+        @self.router.message(F.text == "📊 Стата")
         @handle_errors("Ошибка получения статистики")
-        def handle_stat_message(message):
+        async def handle_stat_message(message: Message):
             user_id = self.get_user_id(message)
-            self._send_statistics(user_id)
+            await self._send_statistics(user_id)
+        
+        # Регистрируем роутер в диспетчере
+        self.dp.include_router(self.router)
     
     @handle_errors("Ошибка формирования статистики")
-    def _send_statistics(self, user_id: int):
+    async def _send_statistics(self, user_id: int):
         """Отправить статистику пользователю"""
         try:
             # Получаем данные
@@ -58,7 +68,7 @@ class StatHandler(BaseHandler):
             )
             
             # Отправляем фото с подписью
-            self.send_photo_safely(
+            await self.send_photo_safely(
                 chat_id=user_id,
                 photo=screenshot,
                 caption=caption,
@@ -67,7 +77,7 @@ class StatHandler(BaseHandler):
             
         except Exception as e:
             error_message = f"⚠️ Ошибка при получении статистики: {str(e)}"
-            self.send_message_safely(
+            await self.send_message_safely(
                 user_id,
                 error_message,
                 create_back_button("menu")

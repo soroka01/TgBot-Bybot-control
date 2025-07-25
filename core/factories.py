@@ -1,7 +1,9 @@
 """
 Фабрика для создания экземпляров бота и API-сессий
 """
-import telebot
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from pybit.unified_trading import HTTP
 from core.config import config
 from typing import Optional
@@ -19,13 +21,23 @@ class BotFactory(metaclass=SingletonMeta):
     """Фабрика для создания единственного экземпляра бота"""
     
     def __init__(self):
-        self._bot: Optional[telebot.TeleBot] = None
+        self._bot: Optional[Bot] = None
+        self._dp: Optional[Dispatcher] = None
         
-    def get_bot(self) -> telebot.TeleBot:
+    def get_bot(self) -> Bot:
         """Получить экземпляр бота"""
         if self._bot is None:
-            self._bot = telebot.TeleBot(config.TG_TOKEN)
+            self._bot = Bot(
+                token=config.TG_TOKEN,
+                default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+            )
         return self._bot
+    
+    def get_dispatcher(self) -> Dispatcher:
+        """Получить экземпляр диспетчера"""
+        if self._dp is None:
+            self._dp = Dispatcher()
+        return self._dp
 
 class BybitSessionFactory(metaclass=SingletonMeta):
     """Фабрика для создания единственного экземпляра сессии Bybit"""
@@ -46,7 +58,5 @@ class BybitSessionFactory(metaclass=SingletonMeta):
 # Глобальные экземпляры
 bot_factory = BotFactory()
 session_factory = BybitSessionFactory()
-
-# Для обратной совместимости
 bot = bot_factory.get_bot()
 session = session_factory.get_session()
