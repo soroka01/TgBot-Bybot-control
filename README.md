@@ -2,6 +2,8 @@
 
 > Управление фьючерсным аккаунтом Bybit через Telegram: один экран, риск-контроль, AI-анализ, автоматизация и персональные алерты.
 
+🌐 **Язык:** [Русский](README.md) · [English](README_EN.md)
+
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Aiogram](https://img.shields.io/badge/Telegram-aiogram%203-2CA5E0?logo=telegram&logoColor=white)
 ![Bybit](https://img.shields.io/badge/Exchange-Bybit%20V5-F7A600)
