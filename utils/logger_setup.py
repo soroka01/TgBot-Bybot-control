@@ -5,6 +5,22 @@ from datetime import timezone, timedelta
 # UTC+3 timezone
 UTC_PLUS_3 = timezone(timedelta(hours=3))
 
+
+def _configure_console_encoding() -> None:
+    """Не даёт emoji в логах уронить процесс в устаревшей Windows-консоли."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="backslashreplace")
+        except (OSError, ValueError):
+            # Поток может не поддерживать перенастройку (например, при редиректе).
+            pass
+
+
+_configure_console_encoding()
+
 # Настройка логирования: файл + stdout, ротация по размеру, уровни
 logger.remove()  # убираем стандартный handler
 

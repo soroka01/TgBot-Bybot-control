@@ -8,6 +8,9 @@ data/*.sqlite3
 data/*.sqlite3-*
 .env
 *.env
+.env.example
 *.pem
 *.key
 secrets.*
+api/deepseek_logs/
+deepseek_logs/
