@@ -1,207 +1,263 @@
 # 🤖 Crypto Trading Bot for Bybit
 
-> Control a Bybit futures account through Telegram: one live screen, risk controls, AI analysis, automation, and personal alerts.
+> A Telegram control panel for one shared Bybit Unified futures account: live screens, explicit risk limits, personal alerts, DeepSeek analysis, and optional automation.
 
 🌐 **Language:** [Русский](README.md) · [English](README_EN.md)
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Aiogram](https://img.shields.io/badge/Telegram-aiogram%203-2CA5E0?logo=telegram&logoColor=white)
-![Bybit](https://img.shields.io/badge/Exchange-Bybit%20V5-F7A600)
-![License](https://img.shields.io/badge/License-MIT-green)
+![Aiogram](https://img.shields.io/badge/aiogram-3.7%2B-2CA5E0?logo=telegram&logoColor=white)
+![Bybit](https://img.shields.io/badge/Bybit-V5-F7A600)
+![License](https://img.shields.io/badge/License-MIT-2EA44F)
 
-## ✨ Project concept
+## ✨ Overview
 
-This is not a conventional chat bot that floods a conversation with replies. Each chat has **one control message**: buttons, live data, operation results, and system events edit that message in place. The chat stays clean while the user always sees the current screen.
+The bot combines monitoring of Bybit linear USDT contracts, manual actions, AI analysis, an automated trading loop, and personal alerts in one Telegram interface. It tries to maintain one editable bot message per chat instead of producing a chain of replies.
 
-| Area | How it works |
+| Area | Implementation |
 | --- | --- |
-| 🖥️ Interface | One editable inline-keyboard screen per chat |
-| 🔄 Live data | Balance, positions, and market data refresh every two seconds |
-| 🧪 Safe start | `DRY_RUN=True` by default; trading POST requests are simulated |
-| 👥 Multiple users | Alerts, preferences, and activity logs are isolated by Telegram chat ID |
-| 🛡️ Shared account | Only administrators can access the real trading workflow |
+| 🖥️ Interface | Inline keyboards and one persisted screen per chat |
+| 💼 Exchange scope | One connected Bybit Unified Account shared by all administrators |
+| 🧪 Safe default | `DRY_RUN=True`: state-changing Bybit POST requests are simulated |
+| 👥 User data | Preferences, alerts, and activity are separated by Telegram `chat_id` |
+| 🗃️ Storage | Local SQLite with WAL, foreign keys, and a busy timeout |
+
+> ⚠️ The current authorization model is intended for **private chats with trusted users**. Do not connect untrusted users or group chats to an instance that can access a real exchange account.
 
 ## 🚀 Features
 
 ### 🧭 Telegram UX
 
-- **Single-screen UI** — the bot edits the active message rather than sending a chain of new messages.
-- **Live navigation** — opening another screen cancels the previous refresh task, so stale data cannot overwrite the new view.
-- **No stuck buttons** — every callback is acknowledged; buttons on outdated messages guide users back to the current menu.
-- **Safe slow operations** — Bybit, DeepSeek, SQLite, and other blocking calls run outside the event loop.
-- **Spam-free automatic events** — auto-trading and alert notifications edit the screen and are coalesced during bursts.
+- `/start` and `/menu` open the main screen.
+- Balance, positions, technical analysis, market overview, and auto-mode status refresh in the same message.
+- Navigating to another screen cancels the previous live task so stale data cannot overwrite the new view.
+- Slow calls from Telegram handlers run in worker threads and do not block the polling event loop.
+- An unknown callback is handled by a fallback screen that links back to the main menu.
 
 ### 💼 Account and positions
 
-- 💰 Unified Account balance: wallet balance, equity, available funds, position margin, and order margin.
-- 📊 Open positions: side, size, entry price, mark price, PnL, and ROI.
-- 🔍 Position details with stop-loss, take-profit, leverage, and derived metrics.
-- ❌ Close an individual position or all positions with a separate confirmation step.
-- 📜 Closed-PnL history from Bybit.
-- 🧪 In `DRY_RUN`, closing positions and creating orders are shown as simulations and are never sent to the exchange.
+- Unified Account balance: wallet balance, equity, available funds, and margin.
+- Open-position list and details: side, size, entry/mark price, PnL, ROI, TP, SL, and leverage.
+- Close one or all positions after a separate confirmation.
+- Closed PnL history through Bybit V5.
+- In `DRY_RUN`, closes, orders, leverage, and TP/SL changes are not sent to the exchange.
 
-### 📈 Analytics and AI
+### 📈 Analytics and DeepSeek
 
-- Technical indicators: **EMA, RSI, MACD, and ATR**.
-- Multi-timeframe analysis: 3 minutes, 5 minutes, 1 hour, and 4 hours.
-- DeepSeek AI recommendations in strict JSON with number and token validation.
-- Expensive indicator caching: prices remain live without re-fetching candles every two seconds.
-- 🌍 Market overview: market capitalization, 24-hour volume, BTC dominance, and trending assets.
+- EMA, RSI, MACD, and ATR.
+- 3m, 5m, 1h, and 4h timeframes.
+- A 60-second candle-analysis cache while the current price remains live.
+- DeepSeek JSON responses with structure, token, and numeric-field validation.
+- CoinGecko overview: global market capitalization, volume, BTC dominance, and trending assets.
 
 ### 🤖 Automated mode and risk
 
-- Orders only for allowed tokens and only when the exchange minimum lot size is met.
-- `Decimal`-based quantity rounding to the instrument step.
-- Actual stop-loss risk is calculated instead of using only the nominal order amount.
-- Risk/reward, liquidation buffer, maximum per-trade risk, and total portfolio risk checks.
-- New trades are blocked when an existing position is unprotected by a stop-loss.
-- Protection against pyramiding in the same direction and correct handling of an opposite position.
+- `hold`, `close`, `long`, and `short` signals for allowed assets.
+- `Decimal` quantity rounding to the configured instrument step.
+- Minimum-order, actual stop-loss risk, and risk/reward validation.
+- Per-trade and total-portfolio risk limits.
+- Stop-loss checks against the liquidation price.
+- New entries are blocked while an existing position has no protective stop-loss.
+- Protection against another entry in the same direction and handling of an opposite position.
 
-### 🔔 Personal alerts
+### 🔔 Alerts and activity
 
-- 💲 Price alerts and 📊 RSI alerts.
-- Trigger direction: value **above** or **below** a selected threshold.
-- **One-time** and **recurring** modes.
-- Cooldown between triggers.
-- Alerts fire only on an **actual crossing** of the level: creating an alert does not immediately produce noise when the price is already beyond the threshold.
-- Each user can choose a default asset and RSI interval in their alert profile.
-- Creation, deletion, and triggering are written to a local activity log.
+- Price and RSI alerts above or below a threshold.
+- One-time or repeating mode with a cooldown.
+- Alerts trigger only on an actual threshold crossing.
+- Personal default symbol, RSI interval, and notification toggles.
+- Local history for alert creation/deletion/triggers, position actions, and auto-mode controls.
 
-### 🧾 Activity log and roles
-
-- The log records alert creation, deletion, and triggers; auto-mode starts and stops; and position-close requests.
-- `ADMIN_TELEGRAM_IDS` separates users: owners control the shared Bybit account, while everyone else can use alerts, market overview, and their private log.
-- Important: users do not receive separate exchange subaccounts — all trading always belongs to the one connected Bybit account.
-
-## 🗺️ Bot screens
+## 🗺️ Screens and access
 
 | Screen | Purpose | Refresh | Access |
 | --- | --- | --- | --- |
-| 📊 Positions | List and details of open positions | 2 seconds | Administrator |
+| 📊 Positions | Open positions and details | 2 seconds | Administrator |
 | 💰 Balance | Unified Account and margin | 2 seconds | Administrator |
-| 📈 AI recommendations | Build and show a DeepSeek decision | On request | Administrator |
-| 🔍 Market analysis | Indicators and technical context | 2 seconds / candle cache | Administrator |
-| 🔔 Alerts | Create, list, and delete personal alerts | On action | Any user |
-| 🌍 Market overview | Global market data and trends | 30 seconds / 90-second cache | Any user |
-| 📜 Trades | Bybit closed-PnL history | On request | Administrator |
+| 📈 AI recommendations | A DeepSeek decision without automatic execution | On request | Administrator |
+| 🔍 Market analysis | Indicators and multi-timeframe context | 2 seconds; analysis cached for 60 seconds | Administrator |
+| 📜 Trades | Bybit Closed PnL | On request | Administrator |
+| 🤖 Auto mode | Status, start/stop, and local log tail | 2 seconds | Administrator |
+| 🔔 Alerts | Create, list, and delete | On action | Any user |
+| 🌍 Market overview | CoinGecko global/trending data | 30 seconds; 90-second cache | Any user |
 | 🧾 Activity | Personal local events | On request | Any user |
-| 🤖 Auto mode | Status, start, stop, and logs | 2 seconds | Administrator |
-| ⚙️ Settings | Tokens and alert profile | On action | Any user |
+| ⚙️ Settings | Asset and personal alert settings | On action | Any user |
 
-Open the main screen with `/start` or `/menu`.
+## 🔄 Execution flow
+
+```text
+Telegram update
+  └─> activity / access / live-screen middleware
+       └─> handler + telegram_bot/ui.py
+            ├─> api/bybit_api.py ──────> Bybit V5
+            ├─> api/deepseek_api.py ───> DeepSeek API
+            ├─> core/market_overview.py ──> CoinGecko
+            ├─> core/* ────────────────> analysis, alerts, risk, auto mode
+            └─> storage/database.py ───> SQLite
+
+Telegram polling event loop
+  ├─> async alert scheduler
+  └─> dedicated daemon thread for the optional auto-trading loop
+```
+
+`BybitAPI` is the single exchange-adapter implementation, but handlers and background services create separate client instances when needed.
 
 ## 🏗️ Architecture
 
 ```text
 TgBot-Bybot-control/
-├── api/                         # Bybit V5 and DeepSeek clients
-│   ├── bybit_api.py             # Request signing, retries, dry-run
-│   ├── deepseek_api.py          # AI analysis
-│   └── tg_notify.py             # Events through the single screen
-├── core/                        # Business logic
-│   ├── auto_trading.py          # Signal execution and risk controls
-│   ├── alerts.py                # Threshold crossings
-│   ├── alert_scheduler.py       # One async scheduler
-│   ├── market_data.py           # Indicators and candles
-│   ├── market_overview.py       # External market overview
-│   └── prompt_builder.py        # AI prompt contract
-├── storage/
-│   └── database.py              # SQLite repository and schema
+├── api/
+│   ├── bybit_api.py             # Bybit V5 signing, reads, POSTs, and dry-run
+│   ├── deepseek_api.py          # OpenAI-compatible DeepSeek client and local logs
+│   └── tg_notify.py             # Auto-mode events routed to Telegram UI
+├── core/
+│   ├── alert_scheduler.py       # Async alert lifecycle
+│   ├── alerts.py                # Price/RSI crossing logic
+│   ├── auto_trading.py          # Signals, execution, and risk checks
+│   ├── market_data.py           # Candles and indicators
+│   ├── market_overview.py       # Cached CoinGecko overview
+│   └── prompt_builder.py        # DeepSeek response contract
+├── storage/database.py          # SQLite schema and repository
 ├── telegram_bot/
-│   ├── ui.py                    # One-message editing
-│   ├── activity_middleware.py   # Profiles and role controls
-│   ├── handlers/                # Telegram screens
-│   └── keyboards/               # Inline keyboards
-├── utils/                       # Calculations, formatting, logging
-├── config.py                    # Safe defaults without secrets
-├── requirements.txt
-└── main.py                      # CLI entry point
+│   ├── bot.py                   # Polling entrypoint
+│   ├── activity_middleware.py   # Profiles and trading access
+│   ├── handlers/                # Telegram screens and actions
+│   ├── keyboards/               # Inline keyboards
+│   └── ui.py                    # Single-message rendering and live tasks
+├── utils/                       # Formatting, calculations, and logging
+├── config.py                    # Environment-backed runtime settings
+├── main.py                      # CLI mode selector
+├── start.bat                    # Windows Telegram launcher
+└── run.bat                      # Windows interactive launcher
 ```
 
-There are no legacy parallel `features`, `services`, or `tasks` layers, and no second thread-based scheduler. The project uses one event loop, one Bybit adapter, and one trading-execution path.
-
-## 🗃️ Database and scaling
-
-By default, the bot creates `data/crypto_bot.sqlite3`; Git ignores it.
-
-| Table | Stores |
-| --- | --- |
-| `users` | Telegram profile, role, status, locale, time zone, notification preferences, last screen, and default asset/interval |
-| `alerts` | Type, symbol, threshold, direction, interval, recurring flag, cooldown, last value, and trigger count |
-| `activity_log` | Personal actions, alert events, and system records |
-
-### Why SQLite
-
-- ✅ Reliable persistent storage without another server.
-- ✅ WAL mode, foreign keys, transactions, and a busy timeout.
-- ✅ A good fit for one Telegram-bot process and typical multi-user load.
-- ➡️ Use PostgreSQL for multiple concurrently running instances, replication, or much higher concurrency.
-- ➡️ Redis is not the source of truth for alerts; it could be added later only for caching or distributed locks.
-
-The UI and domain logic do not write SQL directly, so storage can be replaced without rewriting the Telegram screens.
-
-## ⚙️ Install and run
+## ⚙️ Installation
 
 Requires **Python 3.10+**.
 
 ```powershell
-pip install -r requirements.txt
-python main.py
+git clone https://github.com/soroka01/TgBot-Bybot-control.git
+cd TgBot-Bybot-control
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
-Launch modes:
+On Linux/macOS, activate the environment with `source .venv/bin/activate`.
+
+## 🔐 Configuration
+
+The project reads secrets only from the **process environment**. It does not load `.env` or `config.json`.
+
+Minimal PowerShell example for the Telegram UI:
 
 ```powershell
-python main.py telegram  # Telegram bot
-python main.py auto      # Automated mode from the console
-python main.py --help    # Help
+$env:TELEGRAM_TOKEN="replace-with-telegram-token"
+$env:ADMIN_TELEGRAM_IDS="123456789"
+$env:BYBIT_API_KEY="replace-with-read-trade-key"
+$env:BYBIT_API_SECRET="replace-with-api-secret"
+$env:DEEPSEEK_API_KEY="replace-with-deepseek-key"
+$env:DRY_RUN="True"
+python main.py telegram
 ```
 
-### 🔐 Process environment variables
+Equivalent Bash example:
 
-The project **does not create or load `.env` files**, does not use `config.json`, and does not store keys in Git.
+```bash
+export TELEGRAM_TOKEN="replace-with-telegram-token"
+export ADMIN_TELEGRAM_IDS="123456789"
+export BYBIT_API_KEY="replace-with-read-trade-key"
+export BYBIT_API_SECRET="replace-with-api-secret"
+export DEEPSEEK_API_KEY="replace-with-deepseek-key"
+export DRY_RUN="True"
+python main.py telegram
+```
 
-| Variable | Purpose |
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TELEGRAM_TOKEN` | empty | Required for Telegram polling |
+| `ADMIN_TELEGRAM_IDS` | empty | Comma-separated Telegram user IDs; without them new users receive no trading access |
+| `BYBIT_API_KEY` | empty | Required for private balance/position reads and the trading loop |
+| `BYBIT_API_SECRET` | empty | Signing secret for private Bybit requests |
+| `DEEPSEEK_API_KEY` | empty | Required for AI recommendations and automated analysis |
+| `DEEPSEEK_API_URL` | `https://api.deepseek.com/v1` | OpenAI-compatible endpoint |
+| `DRY_RUN` | `True` | Simulates state-changing Bybit POST requests when true |
+| `POLL_INTERVAL` | `180` | Delay between auto-mode cycles, in seconds |
+| `MAX_LEVERAGE` | `10` | Maximum permitted leverage |
+| `MAX_RISK_PER_TRADE_PERCENT` | `2` | Maximum risk per trade as a percentage of equity |
+| `MAX_TOTAL_RISK_PERCENT` | `10` | Maximum total risk as a percentage of equity |
+| `MIN_ORDER_SIZE_USDT` | `10` | Minimum nominal order value |
+| `CRYPTO_DB_PATH` | `data/crypto_bot.sqlite3` | SQLite file path |
+
+The assets (`BTC`, `ETH`, `SOL`, `XRP`, `BNB`, `DOGE`) and Bybit `linear` category are defined in `config.py`.
+
+### `DRY_RUN` semantics
+
+`DRY_RUN=True` prevents **POST requests** that change Bybit state. Public and private GET requests remain real, so balance/positions and the complete auto loop still require valid Bybit credentials. This is a local simulation, not Bybit testnet; the API host is fixed to production in the current version.
+
+## ▶️ Running
+
+```powershell
+python main.py telegram  # Telegram UI
+python main.py auto      # Auto loop in this process, without Telegram polling
+python main.py           # Interactive selector
+python main.py --help
+```
+
+Windows launchers:
+
+- `start.bat` enters the project directory, creates `.venv` when missing, installs `requirements.txt`, and runs `python main.py telegram`.
+- `run.bat` performs the same bootstrap and starts interactive `python main.py`.
+
+Environment variables must be present before a `.bat` file starts. In standalone `auto` mode the Telegram UI is not registered, so events remain in the local log.
+
+## 🗃️ Runtime data
+
+| Path | Contents |
 | --- | --- |
-| `TELEGRAM_TOKEN` | Required to run the Telegram bot |
-| `BYBIT_API_KEY`, `BYBIT_API_SECRET` | Bybit private data and live trading |
-| `DEEPSEEK_API_KEY` | AI recommendations |
-| `ADMIN_TELEGRAM_IDS` | Comma-separated Telegram user IDs of owners |
-| `DRY_RUN` | `True` by default; `False` allows real POST requests |
-| `CRYPTO_DB_PATH` | Optional path to the SQLite file |
+| `data/crypto_bot.sqlite3` | Profiles, roles, preferences, screens, alerts, and activity |
+| `crypto_bot.log` | Rotating general runtime log |
+| `api/deepseek_logs/` | Part of the context, reasoning when available, and DeepSeek responses |
 
-> ⚠️ Without `ADMIN_TELEGRAM_IDS`, trading buttons are intentionally unavailable to everyone. This prevents a random bot user from reaching the shared exchange account.
+Git ignores these files, but they can still contain sensitive account and trading context. Protect the project directory and its backups.
 
-## 🛡️ Security and limitations
+## 🛡️ Access model and security
 
-- Never share API keys in a chat, commit, or screenshot.
-- Give the Bybit API the minimum permissions: read and trade, with no withdrawal permission.
-- Test workflows with `DRY_RUN=True` first.
-- `DRY_RUN=False` sends real trading POST requests; the account owner remains responsible for every trading decision.
-- A background alert never creates a new message. If a user manually deletes the active screen, a new one appears only after their next action.
-- Entering an alert threshold leaves the user's input message in Telegram — this is a platform limitation; the bot response still edits the one control screen.
+- One process connects to **one shared Bybit account**; users do not receive subaccounts.
+- Use the bot only in private chats. Profiles and roles are stored by `chat_id`, so the current schema does not safely separate members of a group chat.
+- An administrator role is persisted in SQLite. Removing an ID from `ADMIN_TELEGRAM_IDS` does not revoke an already stored `is_admin`; revocation also requires clearing or updating the relevant database row.
+- Auto-mode events currently go to every persisted active screen, not administrators only. Do not connect untrusted users to a trading instance.
+- Use a Bybit key with read/trade permissions only and **no withdrawal permission**.
+- Never put keys in Telegram, an issue, a commit, a screenshot, or a log.
+- DeepSeek receives prepared market and account context; account for this when choosing data and a provider.
+- Verify workflows with `DRY_RUN=True` first. `DRY_RUN=False` enables real operations.
 
-## 🧪 Change verification
+## ⚠️ Limitations
 
-No production tests are included in the repository. Before publishing, the project uses buffer checks:
+- Only the `linear` USDT instruments defined in code are supported.
+- The alert scheduler runs in the polling event loop, while auto-trading uses a separate daemon thread: this is one process, not one thread.
+- SQLite is intended for one instance. Multiple concurrent processes need different coordination and storage.
+- CoinGecko, DeepSeek, and Bybit can enforce rate limits or become temporarily unavailable.
+- A background alert edits an existing screen and does not create a replacement if the user deleted it manually.
+- Entering an alert threshold leaves the user's input as a separate Telegram message.
 
-- Python module compilation;
-- Telegram-bot import;
-- SQLite schema check;
-- two isolated users;
-- one-time and recurring alert crossings;
+## 🧪 Verification
+
+The repository currently has no automated test suite or CI. Changes need at least:
+
+- Python syntax checks;
+- a Telegram entrypoint import with a test environment;
+- a temporary SQLite schema check;
+- scenarios with two isolated private chats;
+- one-time and repeating alert-crossing scenarios;
+- a manual `DRY_RUN` check;
 - `git diff --check`.
+
+These are required smoke-check areas, not an automatically executed pipeline.
 
 ## 📄 License
 
-This project is available under the [MIT License](LICENSE).
-
-```text
-Copyright (c) 2026 soroka01
-```
-
-The license permits use, modification, and distribution provided that the license text and warranty disclaimer are retained.
+Distributed under the [MIT License](LICENSE).
 
 ---
 
-💙 Built for tidy crypto-account control: fewer messages, more context, and more predictable behavior.
+💙 One screen, explicit limits, and as much context as possible before a trading action.
