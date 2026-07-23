@@ -9,22 +9,24 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from config import TRADABLE_TOKENS
 from storage.database import get_store
-from telegram_bot.keyboards.main_menu import get_settings_menu
 from telegram_bot.ui import render_callback_screen
 
 router = Router()
 
 
 def profile_markup(user: dict) -> InlineKeyboardMarkup:
-    token_rows = [
+    token_buttons = [
         InlineKeyboardButton(
             text=("✅ " if token == user.get("default_symbol") else "") + token,
             callback_data=f"settings:symbol:{token}",
         ) for token in TRADABLE_TOKENS
     ]
+    token_rows = [
+        token_buttons[index:index + 3]
+        for index in range(0, len(token_buttons), 3)
+    ]
     return InlineKeyboardMarkup(inline_keyboard=[
-        token_rows[:3],
-        token_rows[3:],
+        *token_rows,
         [
             InlineKeyboardButton(
                 text=f"Интервал: {user.get('default_interval', '15')}м",
@@ -43,7 +45,7 @@ def profile_text(user: dict) -> str:
     return (
         "👤 <b>Профиль алертов</b>\n\n"
         f"Актив по умолчанию: <code>{user.get('default_symbol', 'BTC')}</code>\n"
-        f"Интервал RSI: <code>{user.get('default_interval', '15')} мин</code>\n"
+        f"Интервал графика/RSI: <code>{user.get('default_interval', '15')} мин</code>\n"
         f"Уведомления: <code>{'включены' if user.get('notifications_enabled') else 'выключены'}</code>\n\n"
         "<i>Торговые лимиты общие для одного биржевого аккаунта; "
         "персональными здесь являются только алерты и отображение.</i>"
@@ -96,7 +98,7 @@ async def cycle_interval(callback: CallbackQuery) -> None:
     await asyncio.to_thread(
         get_store().update_user_settings, callback.message.chat.id, default_interval=next_interval
     )
-    await callback.answer(f"RSI-интервал: {next_interval} мин")
+    await callback.answer(f"Интервал: {next_interval} мин")
     await show_profile(callback)
 
 

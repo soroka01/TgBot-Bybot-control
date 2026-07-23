@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import math
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import ALERT_DEFAULT_COOLDOWN_SECONDS
 from storage.database import get_store
 from telegram_bot.keyboards.alerts_menu import (
     get_alert_list_menu,
     get_alert_type_menu,
-    get_alerts_menu,
 )
-from telegram_bot.ui import render_callback_screen, render_command_screen
+from telegram_bot.ui import (
+    callback_action,
+    render_callback_screen,
+    render_command_screen,
+)
 from utils.helpers import format_price
 
 router = Router()
@@ -96,9 +100,21 @@ async def request_threshold(callback: CallbackQuery, state: FSMContext) -> None:
     await render_callback_screen(
         callback.message,
         f"➕ <b>Новый алерт</b>\n\nВведите {label} одним числом.\n"
-        "Для отмены нажмите «Меню».",
-        get_alerts_menu(),
+        "Сообщение с числом будет удалено после обработки.",
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="alerts:cancel")]
+            ]
+        ),
     )
+
+
+@router.callback_query(F.data == "alerts:cancel")
+async def cancel_threshold(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.answer("Ввод отменён")
+    text, markup = await asyncio.to_thread(build_alerts_view, callback.message.chat.id)
+    await render_callback_screen(callback.message, text, markup)
 
 
 @router.message(AlertInput.waiting_for_threshold)
@@ -107,14 +123,31 @@ async def save_threshold(message: Message, state: FSMContext) -> None:
     try:
         threshold = float((message.text or "").strip().replace(",", "."))
         kind = data["kind"]
-        if threshold <= 0 or (kind == "rsi" and threshold > 100):
+        if (
+            not math.isfinite(threshold)
+            or threshold <= 0
+            or (kind == "rsi" and threshold > 100)
+        ):
             raise ValueError
     except (ValueError, KeyError):
+        try:
+            await message.delete()
+        except Exception:
+            pass
         await render_command_screen(
             message,
             "⚠️ <b>Некорректное значение.</b> Введите положительное число"
             + (" от 0 до 100." if data.get("kind") == "rsi" else "."),
-            get_alerts_menu(),
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="❌ Отмена",
+                            callback_data="alerts:cancel",
+                        )
+                    ]
+                ]
+            ),
         )
         return
 
@@ -142,6 +175,10 @@ async def save_threshold(message: Message, state: FSMContext) -> None:
         payload={"kind": data["kind"], "threshold": threshold},
     )
     await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
     text, markup = await asyncio.to_thread(build_alerts_view, message.chat.id)
     await render_command_screen(message, f"✅ Алерт #{alert_id} сохранён.\n\n{text}", markup)
 
@@ -149,7 +186,7 @@ async def save_threshold(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("alerts:delete:"))
 async def delete_alert(callback: CallbackQuery) -> None:
     try:
-        alert_id = int(callback.data.rsplit(":", 1)[-1])
+        alert_id = int(callback_action(callback.data).rsplit(":", 1)[-1])
     except ValueError:
         await callback.answer("Некорректный алерт", show_alert=True)
         return

@@ -12,8 +12,9 @@ from aiogram.types import CallbackQuery
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from api.bybit_api import BybitAPI, BybitAPIError
+from api.bybit_api import BybitAPI
 from config import DRY_RUN
+from core.auto_trading import execution_lock
 from storage.database import get_store
 from telegram_bot.keyboards.main_menu import get_main_menu
 from telegram_bot.keyboards.positions_menu import (
@@ -22,7 +23,7 @@ from telegram_bot.keyboards.positions_menu import (
     get_position_actions_menu,
     get_positions_list_menu,
 )
-from telegram_bot.ui import render_callback_screen, render_live_screen
+from telegram_bot.ui import callback_action, render_callback_screen, render_live_screen
 from utils.helpers import calculate_position_roi, format_price, to_float
 from utils.logger_setup import logger
 
@@ -35,10 +36,16 @@ def _open_positions(positions: list[dict]) -> list[dict]:
 
 def build_positions_view():
     """Load the position list. Executed in a worker thread by the live screen."""
-    positions = _open_positions(BybitAPI().get_positions().get("result", {}).get("list", []))
+    bybit = BybitAPI()
+    try:
+        positions = _open_positions(
+            bybit.get_positions().get("result", {}).get("list", [])
+        )
+    finally:
+        bybit.close()
     if not positions:
         return (
-            "📊 <b>Открытые позиции</b> <i>• обновление 2с</i>\n\n"
+            "📊 <b>Открытые позиции</b> <i>• обновление 8с</i>\n\n"
             "Позиции отсутствуют.",
             get_main_menu(),
         )
@@ -55,7 +62,7 @@ def build_positions_view():
     total_pnl = sum(position["unrealized_pnl"] for position in position_data)
     pnl_emoji = "💚" if total_pnl >= 0 else "❤️"
     text = (
-        f"📊 <b>Открытые позиции ({len(position_data)})</b> <i>• обновление 2с</i>\n\n"
+        f"📊 <b>Открытые позиции ({len(position_data)})</b> <i>• обновление 8с</i>\n\n"
         f"{pnl_emoji} <b>Общий PnL:</b> <code>${total_pnl:+.2f}</code>\n\n"
         "Выберите позицию для деталей:"
     )
@@ -65,24 +72,28 @@ def build_positions_view():
 def build_position_details_view(symbol: str, position_idx: int):
     """Load one precise position, including its hedge-mode index."""
     bybit = BybitAPI()
-    positions = _open_positions(bybit.get_positions(symbol=symbol).get("result", {}).get("list", []))
-    position = next(
-        (
-            candidate
-            for candidate in positions
-            if int(to_float(candidate.get("positionIdx"))) == position_idx
-        ),
-        None,
-    )
-    if not position:
-        raise ValueError("Позиция уже закрыта или не найдена")
-
-    ticker = bybit.get_tickers(symbol)["result"]["list"][0]
+    try:
+        positions = _open_positions(
+            bybit.get_positions(symbol=symbol).get("result", {}).get("list", [])
+        )
+        position = next(
+            (
+                candidate
+                for candidate in positions
+                if int(to_float(candidate.get("positionIdx"))) == position_idx
+            ),
+            None,
+        )
+        if not position:
+            raise ValueError("Позиция уже закрыта или не найдена")
+        ticker = bybit.get_tickers(symbol)["result"]["list"][0]
+    finally:
+        bybit.close()
     quantity = to_float(position.get("size"))
     side = position.get("side", "")
     entry_price = to_float(position.get("avgPrice", position.get("entryPrice")))
     current_price = to_float(ticker.get("lastPrice"))
-    leverage = int(to_float(position.get("leverage"), 1))
+    leverage = to_float(position.get("leverage"), 1)
     unrealized_pnl = to_float(position.get("unrealisedPnl"))
     roi = calculate_position_roi(unrealized_pnl, quantity, entry_price, leverage)
     take_profit = to_float(position.get("takeProfit"))
@@ -92,12 +103,12 @@ def build_position_details_view(symbol: str, position_idx: int):
     pnl_emoji = "💚" if unrealized_pnl >= 0 else "❤️"
 
     text = (
-        f"{side_emoji} <b>{symbol} — {side}</b> <i>• обновление 2с</i>\n\n"
+        f"{side_emoji} <b>{symbol} — {side}</b> <i>• обновление 8с</i>\n\n"
         f"💰 <b>Размер:</b> <code>{quantity:g}</code>\n"
         f"📊 <b>Вход:</b> <code>{format_price(entry_price)}</code>\n"
         f"💵 <b>Текущая цена:</b> <code>{format_price(current_price)}</code>\n"
         f"💼 <b>Номинал:</b> <code>${quantity * current_price:,.2f}</code>\n"
-        f"⚡ <b>Плечо:</b> <code>{leverage}x</code>\n\n"
+        f"⚡ <b>Плечо:</b> <code>{leverage:g}x</code>\n\n"
         f"{pnl_emoji} <b>PnL:</b> <code>${unrealized_pnl:+.2f}</code> | "
         f"<b>ROI:</b> <code>{roi:+.2f}%</code>\n"
     )
@@ -113,51 +124,70 @@ def build_position_details_view(symbol: str, position_idx: int):
 def close_position(symbol: str, position_idx: int) -> str:
     """Close one selected position and require an explicit exchange confirmation."""
     bybit = BybitAPI()
-    positions = _open_positions(bybit.get_positions(symbol=symbol).get("result", {}).get("list", []))
-    position = next(
-        (
-            candidate
-            for candidate in positions
-            if int(to_float(candidate.get("positionIdx"))) == position_idx
-        ),
-        None,
-    )
-    if not position:
-        raise ValueError("Позиция уже закрыта или не найдена")
-
-    side = position.get("side", "")
-    close_side = "Sell" if side == "Buy" else "Buy"
-    response = bybit.close_position_market(symbol, close_side, position_idx)
-    if response.get("retCode") != 0:
-        raise BybitAPIError(response.get("retMsg", "Биржа не подтвердила закрытие"))
-    return side
+    try:
+        with execution_lock():
+            positions = _open_positions(
+                bybit.get_positions(symbol=symbol).get("result", {}).get("list", [])
+            )
+            position = next(
+                (
+                    candidate
+                    for candidate in positions
+                    if int(to_float(candidate.get("positionIdx"))) == position_idx
+                ),
+                None,
+            )
+            if not position:
+                raise ValueError("Позиция уже закрыта или не найдена")
+            side = position.get("side", "")
+            close_side = "Sell" if side == "Buy" else "Buy"
+            bybit.close_position_market(
+                symbol,
+                close_side,
+                position_idx,
+                order_link_id=bybit.new_order_link_id("manual-close"),
+            )
+            return side
+    finally:
+        bybit.close()
 
 
 def close_all_positions() -> tuple[int, list[str]]:
     """Close every open position, keeping errors per symbol for the single screen."""
     bybit = BybitAPI()
-    positions = _open_positions(bybit.get_positions().get("result", {}).get("list", []))
-    closed_count = 0
-    errors: list[str] = []
-    for position in positions:
-        symbol = position.get("symbol", "?")
-        side = position.get("side", "")
-        position_idx = int(to_float(position.get("positionIdx")))
-        try:
-            response = bybit.close_position_market(
-                symbol, "Sell" if side == "Buy" else "Buy", position_idx
+    try:
+        with execution_lock():
+            positions = _open_positions(
+                bybit.get_positions().get("result", {}).get("list", [])
             )
-            if response.get("retCode") != 0:
-                raise BybitAPIError(response.get("retMsg", "позиция не закрыта"))
-            closed_count += 1
-        except Exception as error:
-            errors.append(f"{symbol}: {error}")
-    return closed_count, errors
+            closed_count = 0
+            errors: list[str] = []
+            for position in positions:
+                symbol = position.get("symbol", "?")
+                side = position.get("side", "")
+                position_idx = int(to_float(position.get("positionIdx")))
+                try:
+                    bybit.close_position_market(
+                        symbol,
+                        "Sell" if side == "Buy" else "Buy",
+                        position_idx,
+                        order_link_id=bybit.new_order_link_id("manual-all"),
+                    )
+                    closed_count += 1
+                except Exception as error:
+                    errors.append(f"{symbol}: {error}")
+            return closed_count, errors
+    finally:
+        bybit.close()
 
 
 def build_history_view():
     """Build a concise history screen using actual fees returned by Bybit."""
-    trades = BybitAPI().get_closed_pnl(limit=20).get("result", {}).get("list", [])
+    bybit = BybitAPI()
+    try:
+        trades = bybit.get_closed_pnl(limit=20).get("result", {}).get("list", [])
+    finally:
+        bybit.close()
     if not trades:
         return "📜 <b>История сделок</b>\n\nИстория пуста.", get_main_menu()
 
@@ -176,12 +206,12 @@ def build_history_view():
         entry = to_float(trade.get("avgEntryPrice"))
         exit_price = to_float(trade.get("avgExitPrice"))
         pnl = to_float(trade.get("closedPnl"))
-        leverage = int(to_float(trade.get("leverage"), 1))
+        leverage = to_float(trade.get("leverage"), 1)
         has_fee = "openFee" in trade or "closeFee" in trade
         fee = to_float(trade.get("openFee")) + to_float(trade.get("closeFee"))
         item = (
             f"{'🟢' if side == 'Buy' else '🔴'} <b>{symbol}</b> {side}\n"
-            f"  💰 <code>${quantity * entry:,.2f}</code> | ⚡ <code>{leverage}x</code>\n"
+            f"  💰 <code>${quantity * entry:,.2f}</code> | ⚡ <code>{leverage:g}x</code>\n"
             f"  📊 <code>{format_price(entry)}</code> → <code>{format_price(exit_price)}</code>\n"
             f"  {'💚' if pnl >= 0 else '❤️'} Closed PnL: <code>${pnl:+.2f}</code>"
             + (f" | Fee: <code>${fee:.2f}</code>" if has_fee else "")
@@ -213,7 +243,7 @@ async def callback_positions(callback: CallbackQuery):
     async def load_positions():
         return await asyncio.to_thread(build_positions_view)
 
-    await render_live_screen(callback.message, load_positions)
+    await render_live_screen(callback.message, load_positions, interval_seconds=8)
 
 
 @router.callback_query(F.data == "positions:refresh")
@@ -239,7 +269,7 @@ async def callback_position_details(callback: CallbackQuery):
     async def load_details():
         return await asyncio.to_thread(build_position_details_view, symbol, position_idx)
 
-    await render_live_screen(callback.message, load_details)
+    await render_live_screen(callback.message, load_details, interval_seconds=8)
 
 
 @router.callback_query(F.data.startswith("pos:close:"))
@@ -263,7 +293,7 @@ async def callback_position_close(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("pos:close_confirm:"))
 async def callback_position_close_confirm(callback: CallbackQuery):
     try:
-        _, _, symbol, index = callback.data.split(":", 3)
+        _, _, symbol, index = callback_action(callback.data).split(":", 3)
         position_idx = int(index)
     except (AttributeError, ValueError):
         await callback.answer("Экран устарел")
@@ -275,7 +305,7 @@ async def callback_position_close_confirm(callback: CallbackQuery):
         result = (
             f"🧪 <b>DRY RUN:</b> {symbol} {side} не отправлялась на биржу."
             if DRY_RUN
-            else f"✅ <b>Запрос на закрытие {symbol} {side} принят биржей.</b>"
+            else f"✅ <b>{symbol} {side} закрыта; исполнение подтверждено.</b>"
         )
         await asyncio.to_thread(
             get_store().log_activity,
@@ -305,12 +335,12 @@ async def callback_close_all_positions(callback: CallbackQuery):
     )
 
 
-@router.callback_query(F.data == "positions:close_all_confirm")
+@router.callback_query(F.data.startswith("positions:close_all_confirm:rev:"))
 async def callback_close_all_confirm(callback: CallbackQuery):
     await callback.answer("Отправляю запросы на закрытие...")
     try:
         closed_count, errors = await asyncio.to_thread(close_all_positions)
-        title = "🧪 <b>Сымитировано закрытий:</b>" if DRY_RUN else "✅ <b>Биржа приняла закрытий:</b>"
+        title = "🧪 <b>Рассчитано закрытий:</b>" if DRY_RUN else "✅ <b>Подтверждено закрытий:</b>"
         text = f"{title} <code>{closed_count}</code>"
         if errors:
             text += "\n\n❌ <b>Ошибки:</b>\n" + "\n".join(

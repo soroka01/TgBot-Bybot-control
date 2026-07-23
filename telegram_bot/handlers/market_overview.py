@@ -10,7 +10,7 @@ from aiogram.types import CallbackQuery
 
 from core.market_overview import get_market_overview
 from telegram_bot.keyboards.main_menu import get_main_menu
-from telegram_bot.ui import render_callback_screen, start_live_updates
+from telegram_bot.ui import render_live_screen
 
 router = Router()
 
@@ -39,6 +39,4 @@ async def show_market_overview(callback: CallbackQuery) -> None:
     async def loader() -> tuple[str, object]:
         return await asyncio.to_thread(build_overview_view)
 
-    text, markup = await loader()
-    await render_callback_screen(callback.message, text, markup)
-    await start_live_updates(callback.message, loader, interval_seconds=30, initial_markup=markup)
+    await render_live_screen(callback.message, loader, interval_seconds=30)

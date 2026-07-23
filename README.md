@@ -1,138 +1,143 @@
 # 🤖 Crypto Trading Bot for Bybit
 
-> Telegram-панель для одного общего фьючерсного Bybit Unified Account: live-экраны, явные лимиты риска, личные алерты, анализ DeepSeek и опциональная автоматизация.
+> Одно сообщение в Telegram для контроля Bybit Unified Account: позиции, живой текстовый график, алерты, безопасный AI-отбор сетапов и опциональное автоисполнение.
 
 🌐 **Язык:** [Русский](README.md) · [English](README_EN.md)
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Aiogram](https://img.shields.io/badge/aiogram-3.7%2B-2CA5E0?logo=telegram&logoColor=white)
+![Aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0?logo=telegram&logoColor=white)
 ![Bybit](https://img.shields.io/badge/Bybit-V5-F7A600)
 ![License](https://img.shields.io/badge/License-MIT-2EA44F)
 
-## ✨ Обзор
+## Что это
 
-Бот объединяет наблюдение за линейными USDT-контрактами Bybit, ручные действия, AI-анализ, автоматический торговый цикл и персональные алерты в одном Telegram-интерфейсе. Для каждого чата бот старается поддерживать одно редактируемое сообщение вместо цепочки ответов.
+Бот обслуживает один общий фьючерсный Bybit Unified Account и рассчитан на личный Telegram-чат владельца. Он не обещает доходность и не превращает LLM в трейдера: DeepSeek может только выбрать заранее рассчитанный кодом сетап или отказаться от него.
 
-| Область | Реализация |
+| Контур | Как устроен |
 | --- | --- |
-| 🖥️ Интерфейс | Inline-клавиатуры и один сохраняемый экран на чат |
-| 💼 Биржевой контур | Один подключённый Bybit Unified Account для всех администраторов |
-| 🧪 Безопасный default | `DRY_RUN=True`: изменяющие Bybit POST-запросы симулируются |
-| 👥 Пользовательские данные | Настройки, алерты и журнал разделяются по Telegram `chat_id` |
-| 🗃️ Хранилище | Локальная SQLite с WAL, foreign keys и busy timeout |
+| Telegram | Один канонический bot message на чат; навигация и live-данные редактируют его |
+| AI | Выбирает только существующий `candidate_id`; не задаёт объём, плечо, TP или SL |
+| Риск | Размер позиции, комиссии, spread, slippage, net R/R и плечо считает код |
+| Bybit | Динамические правила инструмента, стабильный `orderLinkId`, проверка исполнения |
+| Хранилище | SQLite: профили, экраны, алерты, журнал, outbox и защита от повторного сигнала |
+| Default | `TRADING_MODE=dry`; изменяющие запросы не достигают биржи |
 
-> ⚠️ Текущая модель авторизации рассчитана на **приватные чаты с доверенными пользователями**. Не подключайте недоверенных пользователей или групповые чаты к экземпляру, который имеет доступ к реальному биржевому аккаунту.
+> ⚠️ Это технический инструмент управления риском, а не финансовая рекомендация. Убыточные сделки, проскальзывание, ликвидация, сбои API и потеря капитала всё равно возможны.
 
-## 🚀 Возможности
+## Главное
 
-### 🧭 Telegram UX
+### Один Telegram-экран
 
-- `/start` и `/menu` открывают главный экран.
-- Баланс, позиции, технический анализ, обзор рынка и статус авто-режима обновляются в том же сообщении.
-- Переход на другой экран отменяет старую live-задачу, чтобы она не перезаписала новый экран.
-- Медленные запросы из Telegram handlers выполняются через worker threads и не блокируют event loop polling.
-- Неизвестный callback обрабатывается fallback-экраном с возвратом в главное меню.
+- `/start` создаёт первое сообщение бота; дальше интерфейс редактирует только его.
+- Временная ошибка Telegram, rate limit или сеть не создают дубликат.
+- Новый bot message допускается только если Telegram точно сообщает, что старый удалён или больше не редактируется.
+- Callback со старого сообщения или уже заменённой клавиатуры отклоняется.
+- Все edits сериализованы per chat; старая live-задача отменяется с ожиданием завершения.
+- Auto-событие показывается компактным banner поверх текущего экрана и не уничтожает открытый route.
+- После рестарта сохранённый экран переводится в честное состояние «бот перезапущен».
 
-### 💼 Аккаунт и позиции
+Настоящий PNG-график намеренно не используется. Telegram позволяет перейти из text message в media message, но обратный переход неудобен, а caption ограничен 1024 символами. Поэтому экран `📈 Живой график` показывает доступный и быстрый sparkline из закрытых свечей:
 
-- Баланс Unified Account: wallet balance, equity, свободные средства и маржа.
-- Список и детали открытых позиций: side, size, entry/mark price, PnL, ROI, TP, SL и leverage.
-- Закрытие одной или всех позиций с отдельным подтверждением.
-- История Closed PnL через Bybit V5.
-- В `DRY_RUN` закрытия, ордера, leverage и TP/SL не отправляются на биржу.
+```text
+BTCUSDT · 15м
+$117 420  +1.82% за 32 свечи
+▁▂▃▃▄▅▅▆▇▆▇█
+L 114.8k · EMA20 116.9k · H 118.2k
+```
 
-### 📈 Аналитика и DeepSeek
+### AI — селектор, а не исполнитель
 
-- EMA, RSI, MACD и ATR.
-- Таймфреймы 3m, 5m, 1h и 4h.
-- Кэш свечного анализа на 60 секунд при сохранении live-цены.
-- DeepSeek-ответ в JSON с проверкой структуры, токенов и числовых полей.
-- Глобальный обзор CoinGecko: капитализация, объём, BTC dominance и trending assets.
+1. Код получает позиции, equity, bid/ask/mark, funding и закрытые свечи 3m/5m/1h/4h.
+2. Код определяет режим рынка и строит допустимый кандидат с фиксированными entry reference, TP и SL.
+3. В DeepSeek уходит компактный whitelist snapshot без raw Bybit response, ключей и свободного текста.
+4. DeepSeek возвращает только `hold` или `select_candidate` с существующим ID; закрывать позиции модель не может.
+5. Локальная строгая схема проверяет `snapshot_id`, срок действия, символы, состояния и отсутствие лишних полей.
+6. Перед ордером код заново проверяет bid/ask, spread и уход цены.
 
-### 🤖 Авто-режим и риск
+Если JSON испорчен, snapshot устарел, timeframe неполон или ID выдуман, весь batch отклоняется без ордеров.
 
-- Сигналы `hold`, `close`, `long` и `short` для разрешённых активов.
-- Округление количества через `Decimal` по заданному шагу инструмента.
-- Проверки минимального ордера, фактического риска до stop-loss и risk/reward.
-- Лимиты риска одной сделки и всего портфеля.
-- Проверка stop-loss относительно liquidation price.
-- Блокировка новых входов при уже открытой позиции без защитного stop-loss.
-- Защита от повторного входа в том же направлении и обработка противоположной позиции.
+По умолчанию используется актуальная `deepseek-v4-flash` с JSON Output и отключённым thinking mode. Модель настраивается через `DEEPSEEK_MODEL`.
 
-### 🔔 Алерты и журнал
+### Детерминированный риск
 
-- Ценовые и RSI-алерты: выше/ниже порога.
-- Одноразовый или повторяемый режим с cooldown.
-- Срабатывание только при фактическом пересечении порога.
-- Личный default symbol, RSI interval и notification toggles.
-- Локальный журнал создания, удаления и срабатывания алертов, действий с позициями и авто-режимом.
+- количество рассчитывается из equity и расстояния до SL;
+- модель не может влиять на quantity, leverage или бюджет риска;
+- в риск и net R/R входят taker fees, текущий spread и оценка adverse slippage;
+- риск открытых позиций считается от исполнимого `markPrice` до SL, а не от исторического entry;
+- quantity и уровни округляются через `Decimal` по live `qtyStep` и `tickSize`;
+- проверяются `minOrderQty`, `minNotionalValue`, `maxMktOrderQty`, статус инструмента и максимальное плечо;
+- плечо выбирается минимально необходимое, но не выше `AUTO_LEVERAGE` и лимита инструмента;
+- авто-входы разрешены только для Unified Account в режиме `REGULAR_MARGIN`; `ISOLATED_MARGIN`, `PORTFOLIO_MARGIN` и неизвестные режимы блокируются;
+- новые входы также блокируются при позиции без SL, активном увеличивающем ордере, опасном статусе позиции, неподдерживаемой USDC/inverse/options экспозиции, некорректных account-wide полях баланса или достижении дневного loss guard;
+- auto-stop разрешено только подтягивать, но никогда не расширять;
+- выходами управляют только TP/SL, детерминированный safety guard или подтверждённая ручная команда владельца; автоматический разворот запрещён;
+- один и тот же candle candidate резервируется в SQLite только один раз.
 
-## 🗺️ Экраны и доступ
+### Надёжное исполнение Bybit
 
-| Экран | Что показывает | Обновление | Доступ |
-| --- | --- | --- | --- |
-| 📊 Позиции | Открытые позиции и детали | 2 секунды | Администратор |
-| 💰 Баланс | Unified Account и маржа | 2 секунды | Администратор |
-| 📈 AI-рекомендации | Решение DeepSeek без автоматического исполнения | По запросу | Администратор |
-| 🔍 Анализ рынка | Индикаторы и multi-timeframe context | 2 секунды, анализ кэшируется 60 секунд | Администратор |
-| 📜 Сделки | Closed PnL Bybit | По запросу | Администратор |
-| 🤖 Авто-режим | Статус, start/stop и локальный log tail | 2 секунды | Администратор |
-| 🔔 Алерты | Создание, список и удаление | По действию | Любой пользователь |
-| 🌍 Обзор рынка | CoinGecko global/trending data | 30 секунд, кэш 90 секунд | Любой пользователь |
-| 🧾 Журнал | Личные локальные события | По запросу | Любой пользователь |
-| ⚙️ Настройки | Актив и параметры личных алертов | По действию | Любой пользователь |
+- GET-запросы повторяются с backoff; state-changing POST не повторяется вслепую после timeout.
+- Каждый логический ордер получает стабильный уникальный `orderLinkId`.
+- При потерянном ответе бот ищет этот ID через realtime/history вместо создания второго ордера.
+- Ответ `order/create` считается только асинхронным ACK.
+- Успех показывается после terminal status `Filled` и проверки фактической позиции.
+- Auto-entry отправляется как рыночный IOC Limit с жёсткой границей цены и прикреплёнными Full TP/SL.
+- Entry дополнительно проверяет наличие TP и SL; если восстановить защиту не удалось, бот пытается аварийно закрыть позицию.
+- Частично исполненный safety-exit немедленно сверяется по остатку и повторяется ограниченно; неопределённый остаток аварийно останавливает auto-mode.
+- `set_trading_stop` всегда отправляет TP и SL парой с `tpslMode=Full`, Market execution и MarkPrice trigger.
+- Время подписи синхронизируется с сервером Bybit; rate-limit headers учитываются.
+- Позиции и активные ордера читаются с пагинацией.
 
-## 🔄 Поток выполнения
+## Экраны
+
+| Экран | Содержимое | Обновление |
+| --- | --- | --- |
+| 📊 Позиции | Позиции, PnL, ROI, TP/SL, подтверждённое закрытие | 8с |
+| 💰 Баланс | Wallet, equity, margin, available balance | 10с |
+| 📈 Живой график | Sparkline, H/L, EMA20/50, RSI, ATR, spread | 15с |
+| 🔍 Рынок | Цена, 24h change, режим, RSI и spread | 15с |
+| 🧠 AI-сетапы | Read-only выбор и полный deterministic trade plan | По запросу |
+| 🤖 Авто | Lifecycle, режим, лимиты, последний цикл и ошибка | 5с |
+| 🔔 Алерты | Price/RSI crossing, once/repeat | 15с scheduler |
+| 🧾 События | Личный activity log | По запросу |
+| 📜 Сделки | Bybit Closed PnL | По запросу |
+
+Торговые, account и AI callback доступны только ID из `ADMIN_TELEGRAM_IDS`. Групповые чаты блокируются. Сохранённый `is_admin` в SQLite не является источником авторизации.
+
+## Архитектура
 
 ```text
 Telegram update
-  └─> activity / access / live-screen middleware
-       └─> handler + telegram_bot/ui.py
-            ├─> api/bybit_api.py ──────> Bybit V5
-            ├─> api/deepseek_api.py ───> DeepSeek API
-            ├─> core/market_overview.py ──> CoinGecko
-            ├─> core/* ────────────────> analysis, alerts, risk, auto mode
-            └─> storage/database.py ───> SQLite
-
-Telegram polling event loop
-  ├─> async alert scheduler
-  └─> dedicated daemon thread for the optional auto-trading loop
+  └─> private-chat/access/stale-screen guards
+       └─> single-message Screen Manager
+            ├─> handlers ───────────────> read screens / confirmed actions
+            ├─> alert scheduler ────────> durable notification outbox
+            └─> atomic auto worker
+                  ├─> closed-candle features
+                  ├─> deterministic candidates
+                  ├─> DeepSeek selector
+                  ├─> deterministic risk engine
+                  └─> serialized Bybit execution + reconciliation
 ```
-
-`BybitAPI` — единая реализация биржевого адаптера, но handlers и фоновые сервисы создают отдельные экземпляры клиента по мере необходимости.
-
-## 🏗️ Архитектура
 
 ```text
-TgBot-Bybot-control/
-├── api/
-│   ├── bybit_api.py             # Bybit V5 signing, reads, POSTs and dry-run
-│   ├── deepseek_api.py          # OpenAI-compatible DeepSeek client and local logs
-│   └── tg_notify.py             # Auto-mode events routed to Telegram UI
-├── core/
-│   ├── alert_scheduler.py       # Async alert lifecycle
-│   ├── alerts.py                # Price/RSI crossing logic
-│   ├── auto_trading.py          # Signals, execution and risk checks
-│   ├── market_data.py           # Candles and indicators
-│   ├── market_overview.py       # Cached CoinGecko overview
-│   └── prompt_builder.py        # DeepSeek response contract
-├── storage/database.py          # SQLite schema and repository
-├── telegram_bot/
-│   ├── bot.py                   # Polling entrypoint
-│   ├── activity_middleware.py   # Profiles and trading access
-│   ├── handlers/                # Telegram screens and actions
-│   ├── keyboards/               # Inline keyboards
-│   └── ui.py                    # Single-message rendering and live tasks
-├── utils/                       # Formatting, calculations and logging
-├── config.py                    # Environment-backed runtime settings
-├── main.py                      # CLI mode selector
-├── start.bat                    # Windows Telegram launcher
-└── run.bat                      # Windows interactive launcher
+api/
+  bybit_api.py          signing, metadata, pagination, orders, reconciliation
+  deepseek_api.py       current model, JSON Output, bounded/private logging
+core/
+  decision_engine.py    snapshot, candidates, strict AI schema
+  risk_engine.py        Decimal sizing, costs, gates, portfolio risk
+  market_data.py        closed candles and technical features
+  chart.py              text sparkline
+  auto_trading.py       cycle and serialized side effects
+  alerts.py             crossing logic
+storage/database.py     SQLite repository, dedupe and notification outbox
+telegram_bot/ui.py      one-message state, locks, revisions and live tasks
+tests/                  network-free safety tests
 ```
 
-## ⚙️ Установка
+## Установка
 
-Требуется **Python 3.10+**.
+Требуется Python 3.10+.
 
 ```powershell
 git clone https://github.com/soroka01/TgBot-Bybot-control.git
@@ -140,124 +145,117 @@ cd TgBot-Bybot-control
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-На Linux/macOS активация окружения выполняется командой `source .venv/bin/activate`.
+`start.bat` создаёт `.venv` при необходимости, устанавливает отсутствующие зависимости и запускает Telegram UI. Для console mode используйте команды из раздела «Запуск».
 
-## 🔐 Конфигурация
+## Конфигурация
 
-Проект читает секреты только из **окружения процесса**. Он не загружает `.env` и `config.json`.
+`config.py` загружает локальный `.env`, но уже заданные process environment variables имеют приоритет. `.env`, ключи, SQLite, runtime logs и DeepSeek logs игнорируются Git.
 
-Минимальный PowerShell-пример для Telegram UI:
+Минимальный безопасный `.env`:
 
-```powershell
-$env:TELEGRAM_TOKEN="replace-with-telegram-token"
-$env:ADMIN_TELEGRAM_IDS="123456789"
-$env:BYBIT_API_KEY="replace-with-read-trade-key"
-$env:BYBIT_API_SECRET="replace-with-api-secret"
-$env:DEEPSEEK_API_KEY="replace-with-deepseek-key"
-$env:DRY_RUN="True"
-python main.py telegram
+```dotenv
+TELEGRAM_TOKEN=...
+ADMIN_TELEGRAM_IDS=123456789
+
+BYBIT_API_KEY=...
+BYBIT_API_SECRET=...
+BYBIT_ENV=testnet
+TRADING_MODE=dry
+
+DEEPSEEK_API_KEY=...
+DEEPSEEK_MODEL=deepseek-v4-flash
 ```
 
-Эквивалентный Bash-пример:
+### Режимы
 
-```bash
-export TELEGRAM_TOKEN="replace-with-telegram-token"
-export ADMIN_TELEGRAM_IDS="123456789"
-export BYBIT_API_KEY="replace-with-read-trade-key"
-export BYBIT_API_SECRET="replace-with-api-secret"
-export DEEPSEEK_API_KEY="replace-with-deepseek-key"
-export DRY_RUN="True"
-python main.py telegram
+| Переменная | Значения | Смысл |
+| --- | --- | --- |
+| `BYBIT_ENV` | `testnet`, `demo`, `mainnet` | Выбирает только официальный API host |
+| `TRADING_MODE` | `dry`, `live` | `dry` блокирует все изменяющие Bybit requests |
+| `LIVE_TRADING_CONFIRMATION` | точная фраза | Дополнительный interlock для `live` |
+
+Для реального исполнения нужны одновременно:
+
+```dotenv
+BYBIT_ENV=mainnet
+TRADING_MODE=live
+LIVE_TRADING_CONFIRMATION=I_ACCEPT_LIVE_TRADING_RISK
 ```
+
+Опечатка в mode не включает LIVE: startup завершается с ошибкой. Старый `DRY_RUN` поддерживается только как migration fallback; для новой конфигурации используйте `TRADING_MODE`.
+
+`dry` — preview без локального paper ledger: GET остаются реальными, но POST не отправляются. Для проверки реальных fills и состояния позиций используйте отдельный Bybit Demo/Testnet account, а не mainnet key.
+
+### Основные лимиты
 
 | Переменная | Default | Назначение |
-| --- | --- | --- |
-| `TELEGRAM_TOKEN` | пусто | Обязательна для Telegram polling |
-| `ADMIN_TELEGRAM_IDS` | пусто | Telegram user IDs администраторов через запятую; без них новые пользователи не получают торговый доступ |
-| `BYBIT_API_KEY` | пусто | Нужна для приватных balance/position reads и торгового цикла |
-| `BYBIT_API_SECRET` | пусто | Секрет подписи приватных запросов Bybit |
-| `DEEPSEEK_API_KEY` | пусто | Нужна для AI-рекомендаций и авто-анализа |
-| `DEEPSEEK_API_URL` | `https://api.deepseek.com/v1` | OpenAI-compatible endpoint |
-| `DRY_RUN` | `True` | При `True` симулирует изменяющие Bybit POST-запросы |
-| `POLL_INTERVAL` | `180` | Пауза между циклами авто-режима, секунд |
-| `MAX_LEVERAGE` | `10` | Максимально разрешённое плечо |
-| `MAX_RISK_PER_TRADE_PERCENT` | `2` | Максимальный риск одной сделки, % equity |
-| `MAX_TOTAL_RISK_PERCENT` | `10` | Максимальный суммарный риск, % equity |
-| `MIN_ORDER_SIZE_USDT` | `10` | Минимальный номинал ордера |
-| `CRYPTO_DB_PATH` | `data/crypto_bot.sqlite3` | Путь к SQLite |
+| --- | ---: | --- |
+| `TRADABLE_TOKENS` | `BTC,ETH,SOL,XRP,BNB,DOGE` | Разрешённые USDT linear assets |
+| `POLL_INTERVAL` | `180` | Пауза auto-loop, секунд |
+| `MAX_RISK_PER_TRADE_PERCENT` | `1` | Максимальный риск сделки от equity |
+| `MAX_TOTAL_RISK_PERCENT` | `5` | Максимальный риск портфеля |
+| `MAX_DAILY_LOSS_PERCENT` | `3` | Закрытый realized loss и account-scoped UTC equity drawdown от high-water |
+| `MAX_POSITION_NOTIONAL_PERCENT` | `100` | Верхняя граница notional от equity |
+| `AUTO_LEVERAGE` | `2` | Верхняя граница автоматически выбранного плеча |
+| `MIN_NET_RISK_REWARD_RATIO` | `1.5` | Минимальный R/R после издержек |
+| `MAX_SPREAD_PERCENT` | `0.15` | Запрет входа при широком spread |
+| `MAX_PRICE_DRIFT_PERCENT` | `0.25` | Допустимый уход цены после snapshot |
+| `BYBIT_MAX_SLIPPAGE_PERCENT` | `0.30` | Жёсткая граница цены IOC-entry и reduce-only exit |
+| `SIGNAL_VALIDITY_SECONDS` | `90` | TTL AI-решения |
 
-Список активов (`BTC`, `ETH`, `SOL`, `XRP`, `BNB`, `DOGE`) и Bybit category `linear` заданы в `config.py`.
+Полный перечень с безопасными defaults находится в [.env.example](.env.example).
 
-### Семантика `DRY_RUN`
-
-`DRY_RUN=True` предотвращает отправку **POST-запросов**, меняющих состояние Bybit. Публичные и приватные GET-запросы остаются реальными, поэтому balance/positions и полноценный auto-loop всё равно требуют действующие Bybit credentials. Это локальная симуляция, а не Bybit testnet; API host в текущей версии фиксирован на production.
-
-## ▶️ Запуск
+## Запуск
 
 ```powershell
-python main.py telegram  # Telegram UI
-python main.py auto      # Авто-цикл в текущем процессе, без Telegram polling
-python main.py           # Интерактивный выбор
-python main.py --help
+python main.py telegram
+python main.py auto
+python main.py
 ```
 
-Windows launchers:
+Перед запуском `auto` проверяются ключи, model ID, режим и bounds. В Telegram LIVE дополнительно требует отдельного подтверждения на экране.
 
-- `start.bat` переходит в каталог проекта, создаёт `.venv` при отсутствии, устанавливает `requirements.txt` и запускает `python main.py telegram`.
-- `run.bat` выполняет тот же bootstrap и запускает интерактивный `python main.py`.
+## Проверка
 
-Переменные окружения должны быть заданы до запуска `.bat`. В standalone `auto` Telegram UI не регистрируется, поэтому события остаются в локальном логе.
+```powershell
+python -m unittest discover -s tests -v
+python -m compileall -q main.py config.py api core storage telegram_bot tests utils
+git diff --check
+```
 
-## 🗃️ Runtime-данные
+Тесты покрывают HMAC, malformed API responses, запрет blind POST retry, reconciliation и partial fills, paired TP/SL, динамическую precision, строгий AI contract, stale snapshot, closed candles, sparkline, risk sizing, portfolio/daily guards, durable outbox и single-message UI.
 
-| Путь | Содержимое |
+Для интеграционной проверки используйте Bybit Demo/Testnet. Автотесты репозитория не отправляют ордера.
+
+## Runtime и приватность
+
+| Путь | Данные |
 | --- | --- |
-| `data/crypto_bot.sqlite3` | Профили, роли, настройки, экраны, алерты и activity log |
-| `crypto_bot.log` | Общий runtime log с ротацией |
-| `api/deepseek_logs/` | Часть контекста, reasoning при наличии и ответы DeepSeek |
+| `data/crypto_bot.sqlite3` | Профили, экраны, алерты, outbox, activity, signal dedupe и UTC equity high-water |
+| `crypto_bot.log` | Rotating runtime log, retention 10 дней |
+| `api/deepseek_logs/` | Только при `DEEPSEEK_LOG_RESPONSES=true` |
 
-Эти файлы игнорируются Git, но могут содержать чувствительную информацию об аккаунте и торговом контексте. Защищайте каталог проекта и резервные копии.
+DeepSeek response logging выключен по умолчанию. При включении сохраняются только model, `snapshot_id` и финальный JSON — не raw wallet context и не reasoning.
 
-## 🛡️ Модель доступа и безопасность
+Используйте Bybit API key только с read/trade permissions и **без withdrawal permission**.
 
-- Один процесс подключён к **одному общему Bybit account**; пользователи не получают субсчета.
-- Используйте бота только в private chats. Профиль и роль хранятся по `chat_id`, поэтому текущая схема не предназначена для безопасного разграничения участников группового чата.
-- Выданная роль администратора сохраняется в SQLite. Удаление ID из `ADMIN_TELEGRAM_IDS` не отзывает уже сохранённый `is_admin`; для отзыва требуется также очистить или обновить соответствующую запись БД.
-- События авто-режима сейчас отправляются на все сохранённые активные экраны, а не только администраторам. Не подключайте недоверенных пользователей к торговому экземпляру.
-- Используйте Bybit key только с read/trade permissions и **без withdrawal permission**.
-- Не передавайте ключи в Telegram, issue, commit, screenshot или log.
-- DeepSeek получает подготовленный рыночный и account context; учитывайте это при выборе данных и провайдера.
-- Сначала проверьте сценарии с `DRY_RUN=True`. `DRY_RUN=False` разрешает реальные операции.
+## Ограничения
 
-## ⚠️ Ограничения
+- Поддерживаются `linear` USDT contracts и один процесс/один Unified Account; авто-вход требует `REGULAR_MARGIN`.
+- SQLite не координирует несколько одновременно запущенных экземпляров приложения.
+- REST reconciliation надёжнее принятия ACK, но private WebSocket мог бы уменьшить latency ещё сильнее.
+- Auto-mode намеренно консервативен и может долго не находить сетапов.
+- Telegram edit существующего сообщения обычно не создаёт полноценное push-уведомление. Алерты здесь — durable in-app banners, но не канал для событий, которые нельзя пропустить.
+- CoinGecko, Telegram, DeepSeek и Bybit могут быть недоступны или менять rate limits.
+- Ни один фильтр не гарантирует прибыль и не устраняет рыночный риск.
 
-- Поддерживаются только заданные в коде `linear` USDT-инструменты.
-- Alert scheduler работает в polling event loop, а auto-trading — в отдельном daemon thread; это один процесс, но не один поток.
-- SQLite подходит для одного экземпляра. Несколько параллельных процессов потребуют другой координации и хранилища.
-- CoinGecko, DeepSeek и Bybit могут применять rate limits или быть временно недоступны.
-- Фоновые алерты редактируют существующий экран и не создают новый, если пользователь удалил его вручную.
-- Ввод порога алерта остаётся отдельным пользовательским сообщением в Telegram.
+## Лицензия
 
-## 🧪 Проверка
-
-В репозитории пока нет автоматизированного test suite и CI. Перед изменениями нужны как минимум:
-
-- синтаксическая проверка Python-модулей;
-- импорт Telegram entrypoint с тестовым окружением;
-- временная SQLite и проверка схемы;
-- сценарии двух изолированных private chats;
-- одноразовые и повторяемые crossing-сценарии алертов;
-- ручная проверка `DRY_RUN`;
-- `git diff --check`.
-
-Эти пункты описывают необходимый smoke-check, а не автоматически выполняемый pipeline.
-
-## 📄 Лицензия
-
-Проект распространяется по лицензии [MIT](LICENSE).
+[MIT](LICENSE)
 
 ---
 
-💙 Один экран, явные ограничения и максимум контекста перед любым торговым действием.
+Один экран. AI без доступа к размеру позиции. Исполнение только после локальных проверок и подтверждения биржи.

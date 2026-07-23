@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable
 
 from api.bybit_api import BybitAPI
 from core.market_data import calculate_rsi, get_kline_data
@@ -15,6 +15,7 @@ from utils.logger_setup import logger
 
 @dataclass(frozen=True)
 class AlertEvent:
+    outbox_id: int
     chat_id: int
     alert_id: int
     message: str
@@ -41,13 +42,22 @@ class AlertService:
         tickers = response.get("result", {}).get("list", [])
         if not tickers:
             raise ValueError(f"Нет тикера для {symbol}USDT")
-        return float(tickers[0]["lastPrice"])
+        price = float(tickers[0]["lastPrice"])
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(f"Некорректная цена {symbol}USDT")
+        return price
+
+    def close(self) -> None:
+        self.bybit.close()
 
     def _rsi(self, symbol: str, timeframe: str) -> float:
         candles = get_kline_data(self.bybit, f"{symbol}USDT", interval=timeframe, limit=100)
         if len(candles) < 15:
             raise ValueError(f"Недостаточно свечей для RSI {symbol}/{timeframe}")
-        return round(calculate_rsi([item["close"] for item in candles]), 2)
+        value = round(calculate_rsi([item["close"] for item in candles]), 2)
+        if not math.isfinite(value) or not 0 <= value <= 100:
+            raise ValueError(f"Некорректный RSI {symbol}/{timeframe}")
+        return value
 
     def check_all(self) -> list[AlertEvent]:
         """Read active alerts, persist observations and return crossed thresholds."""
@@ -64,7 +74,6 @@ class AlertService:
             except Exception as error:
                 logger.warning(f"Не удалось проверить алерты {kind}/{symbol}/{timeframe}: {error}")
 
-        events: list[AlertEvent] = []
         for key, alerts in grouped.items():
             if key not in values:
                 continue
@@ -77,11 +86,6 @@ class AlertService:
                 should_trigger = enabled and _crossed(
                     alert["last_value"], current, alert["direction"], float(alert["threshold"])
                 )
-                if not self.store.apply_alert_observation(
-                    int(alert["id"]), value=current, should_trigger=should_trigger
-                ):
-                    continue
-
                 comparator = "≥" if alert["direction"] == "above" else "≤"
                 value_text = format_price(current) if alert["kind"] == "price" else f"{current:.2f}"
                 unit = "USDT" if alert["kind"] == "price" else ""
@@ -90,6 +94,14 @@ class AlertService:
                     f"{'💲 Цена' if alert['kind'] == 'price' else '📊 RSI'} {alert['symbol']}{timeframe}: "
                     f"{value_text} {unit} {comparator} {alert['threshold']}"
                 ).strip()
+                if not self.store.apply_alert_observation(
+                    int(alert["id"]),
+                    value=current,
+                    should_trigger=should_trigger,
+                    notification_message=message,
+                ):
+                    continue
+
                 self.store.log_activity(
                     int(alert["chat_id"]),
                     "alert_triggered",
@@ -98,5 +110,12 @@ class AlertService:
                     symbol=alert["symbol"],
                     payload={"alert_id": alert["id"], "value": current},
                 )
-                events.append(AlertEvent(int(alert["chat_id"]), int(alert["id"]), message))
-        return events
+        return [
+            AlertEvent(
+                int(item["id"]),
+                int(item["chat_id"]),
+                int(item["alert_id"] or 0),
+                str(item["message"]),
+            )
+            for item in self.store.pending_notifications()
+        ]

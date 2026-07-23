@@ -1,17 +1,14 @@
-# core/market_data.py
-"""
-Модуль для получения рыночных данных и расчета технических индикаторов
-"""
-from typing import List, Sequence, Tuple
+"""Closed-candle market data and deterministic technical features."""
+
+from __future__ import annotations
+
 import time
+from typing import List, Sequence, Tuple
+
 import numpy as np
 from loguru import logger
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.bybit_api import BybitAPI
-from config import BYBIT_CATEGORY
 
 
 ANALYSIS_CACHE_TTL_SECONDS = 60
@@ -19,283 +16,207 @@ _analysis_cache: dict[str, tuple[float, dict]] = {}
 
 
 def calculate_ema(prices: Sequence[float], period: int) -> float:
-    """Рассчитывает EMA (Exponential Moving Average)"""
+    if not prices:
+        return 0.0
     if len(prices) < period:
-        return sum(prices) / len(prices) if prices else 0
-
-    prices_array = np.asarray(prices, dtype=float)
-    ema = prices_array[:period].mean()  # Начальное значение - SMA
+        return float(sum(prices) / len(prices))
+    values = np.asarray(prices, dtype=float)
+    ema = float(values[:period].mean())
     multiplier = 2 / (period + 1)
-
-    for price in prices_array[period:]:
-        ema = (price - ema) * multiplier + ema
-
+    for price in values[period:]:
+        ema = (float(price) - ema) * multiplier + ema
     return float(ema)
 
 
 def calculate_rsi(prices: Sequence[float], period: int = 14) -> float:
-    """Рассчитывает RSI (Relative Strength Index)"""
     if len(prices) < period + 1:
         return 50.0
-
     deltas = np.diff(prices)
     gains = np.where(deltas > 0, deltas, 0)
     losses = np.where(deltas < 0, -deltas, 0)
-
-    avg_gain = gains[:period].mean()
-    avg_loss = losses[:period].mean()
-
-    for i in range(period, len(deltas)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-
-    if avg_loss == 0:
-        # A completely flat series is neutral, not overbought.
-        return 50.0 if avg_gain == 0 else 100.0
-
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-
-    return float(rsi)
+    average_gain = float(gains[:period].mean())
+    average_loss = float(losses[:period].mean())
+    for index in range(period, len(deltas)):
+        average_gain = (average_gain * (period - 1) + float(gains[index])) / period
+        average_loss = (average_loss * (period - 1) + float(losses[index])) / period
+    if average_loss == 0:
+        return 50.0 if average_gain == 0 else 100.0
+    relative_strength = average_gain / average_loss
+    return float(100 - (100 / (1 + relative_strength)))
 
 
 def calculate_macd(
     prices: Sequence[float], fast: int = 12, slow: int = 26, signal: int = 9
 ) -> Tuple[float, float]:
-    """Calculate the MACD and its signal EMA from the MACD history.
-
-    The old code set the signal line equal to MACD, making the histogram always
-    zero and removing the indicator's crossover information.
-    """
     if len(prices) < slow + signal - 1:
         return 0.0, 0.0
-
-    macd_history = [
+    history = [
         calculate_ema(prices[:index], fast) - calculate_ema(prices[:index], slow)
         for index in range(slow, len(prices) + 1)
     ]
-    return float(macd_history[-1]), float(calculate_ema(macd_history, signal))
+    return float(history[-1]), float(calculate_ema(history, signal))
 
 
 def calculate_atr(klines: Sequence[dict], period: int = 14) -> float:
-    """Calculate Wilder's ATR from OHLC candles."""
     if len(klines) < period + 1:
         return 0.0
-
     true_ranges = []
     for index in range(1, len(klines)):
-        high = klines[index]["high"]
-        low = klines[index]["low"]
-        previous_close = klines[index - 1]["close"]
+        high = float(klines[index]["high"])
+        low = float(klines[index]["low"])
+        previous_close = float(klines[index - 1]["close"])
         true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
-
     atr = float(np.mean(true_ranges[:period]))
-    for true_range in true_ranges[period:]:
-        atr = (atr * (period - 1) + true_range) / period
+    for value in true_ranges[period:]:
+        atr = (atr * (period - 1) + value) / period
     return atr
 
 
-def get_kline_data(bybit: BybitAPI, symbol: str, interval: str = "1", limit: int = 200) -> List[dict]:
-    """
-    Получает свечные данные (kline) от Bybit
-    interval: "1" (1 min), "5" (5 min), "15", "60" (1h), "240" (4h), "D" (1d)
+def _interval_ms(interval: str) -> int:
+    if str(interval).isdigit():
+        return int(interval) * 60_000
+    mapping = {"D": 86_400_000, "W": 604_800_000, "M": 2_592_000_000}
+    if interval not in mapping:
+        raise ValueError(f"Неподдерживаемый интервал: {interval}")
+    return mapping[interval]
+
+
+def get_kline_data(
+    bybit: BybitAPI,
+    symbol: str,
+    interval: str = "1",
+    limit: int = 200,
+) -> List[dict]:
+    """Return only confirmed closed candles in chronological order.
+
+    Bybit explicitly documents that the newest open candle's ``closePrice`` is
+    merely the latest trade.  Excluding it prevents repainting AI signals.
     """
     try:
-        params = {
-            "category": BYBIT_CATEGORY,
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit
-        }
-
-        response = bybit._public_get("/v5/market/kline", params=params)
-        klines = response.get("result", {}).get("list", [])
-
-        # Bybit возвращает в обратном порядке (новые первые)
-        klines.reverse()
-
-        parsed = []
-        for k in klines:
-            parsed.append({
-                "timestamp": int(k[0]),
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5]),
-            })
-
-        return parsed
-
-    except Exception as e:
-        logger.error(f"Ошибка получения kline для {symbol}: {e}")
+        response = bybit.get_kline(symbol, interval, limit=min(1_000, limit + 1))
+        server_ms = int(response.get("time") or time.time() * 1_000)
+        duration_ms = _interval_ms(str(interval))
+        rows = list(response.get("result", {}).get("list", []))
+        rows.reverse()
+        parsed = [
+            {
+                "timestamp": int(row[0]),
+                "closed_at": int(row[0]) + duration_ms,
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5]),
+            }
+            for row in rows
+            if int(row[0]) + duration_ms <= server_ms
+        ]
+        return parsed[-limit:]
+    except Exception as error:
+        logger.error(f"Ошибка получения закрытых свечей {symbol}/{interval}: {error}")
         return []
 
 
+def _timeframe_features(klines: Sequence[dict], now_ms: int) -> dict:
+    closes = [float(candle["close"]) for candle in klines]
+    volumes = [float(candle["volume"]) for candle in klines]
+    ema20 = calculate_ema(closes, 20)
+    ema50 = calculate_ema(closes, 50)
+    previous_ema20 = calculate_ema(closes[:-3], 20) if len(closes) > 23 else ema20
+    macd, macd_signal = calculate_macd(closes)
+    window = list(klines[-20:])
+    average_volume = float(np.mean(volumes[-20:])) if volumes else 0.0
+    volume_ratio = volumes[-1] / average_volume if average_volume > 0 else 0.0
+    last_closed_at = int(klines[-1]["closed_at"])
+    return {
+        "ema20": round(ema20, 8),
+        "ema50": round(ema50, 8),
+        "ema20_slope": round(ema20 - previous_ema20, 8),
+        "macd": round(macd, 8),
+        "macd_signal": round(macd_signal, 8),
+        "macd_histogram": round(macd - macd_signal, 8),
+        "rsi14": round(calculate_rsi(closes), 3),
+        "atr14": round(calculate_atr(klines), 8),
+        "volume_ratio": round(volume_ratio, 3),
+        "swing_high": round(max(candle["high"] for candle in window), 8),
+        "swing_low": round(min(candle["low"] for candle in window), 8),
+        "price_series": [round(price, 8) for price in closes[-32:]],
+        "last_closed_candle_at": last_closed_at,
+        "age_ms": max(0, now_ms - last_closed_at),
+    }
+
+
+def _regime(frames: dict[str, dict]) -> str:
+    one_hour = frames["timeframe_1h"]
+    four_hour = frames["timeframe_4h"]
+    bullish = (
+        one_hour["ema20"] > one_hour["ema50"]
+        and four_hour["ema20"] > four_hour["ema50"]
+        and one_hour["ema20_slope"] > 0
+    )
+    bearish = (
+        one_hour["ema20"] < one_hour["ema50"]
+        and four_hour["ema20"] < four_hour["ema50"]
+        and one_hour["ema20_slope"] < 0
+    )
+    if bullish:
+        return "trend_up"
+    if bearish:
+        return "trend_down"
+    return "range"
+
+
 def get_market_analysis(bybit: BybitAPI, symbol: str, current_price: float) -> dict:
-    """
-    Получает полный анализ рынка с техническими индикаторами
-    Анализирует несколько таймфреймов: 3м, 5м, 1ч, 4ч
-    """
     cached = _analysis_cache.get(symbol)
     now = time.monotonic()
     if cached and now - cached[0] < ANALYSIS_CACHE_TTL_SECONDS:
-        # Price changes every live refresh; indicator candles do not need to be
-        # downloaded every two seconds.
         return {**cached[1], "current_price": current_price}
 
     try:
-        # Получаем данные разных таймфреймов
-        klines_3m = get_kline_data(bybit, symbol, interval="3", limit=100)   # 3 минуты (текущий момент)
-        klines_5m = get_kline_data(bybit, symbol, interval="5", limit=100)   # 5 минут
-        klines_1h = get_kline_data(bybit, symbol, interval="60", limit=100)  # 1 час
-        klines_4h = get_kline_data(bybit, symbol, interval="240", limit=50)  # 4 часа
-
-        if not klines_3m or len(klines_3m) < 30:
-            logger.warning(f"Недостаточно данных для {symbol}")
-            return {"error": "insufficient_data"}
-
-        # === АНАЛИЗ 3-МИНУТНОГО ТАЙМФРЕЙМА (текущий момент) ===
-        closes_3m = [k["close"] for k in klines_3m] if klines_3m else []
-        volumes_3m = [k["volume"] for k in klines_3m] if klines_3m else []
-
-        ema20_3m = calculate_ema(closes_3m, 20) if len(closes_3m) >= 20 else 0
-        ema50_3m = calculate_ema(closes_3m, 50) if len(closes_3m) >= 50 else 0
-        rsi14_3m = calculate_rsi(closes_3m, 14) if len(closes_3m) >= 15 else 50
-        macd_3m, macd_signal_3m = calculate_macd(closes_3m)
-
-        avg_volume_3m = np.mean(volumes_3m[-20:]) if len(volumes_3m) >= 20 else 0
-        current_volume_3m = volumes_3m[-1] if volumes_3m else 0
-
-        price_series_3m = [round(p, 8) for p in closes_3m[-10:]] if len(closes_3m) >= 10 else []
-
-        # === АНАЛИЗ 5-МИНУТНОГО ТАЙМФРЕЙМА (краткосрочный тренд) ===
-        closes_5m = [k["close"] for k in klines_5m] if klines_5m else []
-        ema20_5m = calculate_ema(closes_5m, 20) if len(closes_5m) >= 20 else 0
-        ema50_5m = calculate_ema(closes_5m, 50) if len(closes_5m) >= 50 else 0
-        rsi14_5m = calculate_rsi(closes_5m, 14) if len(closes_5m) >= 15 else 50
-        macd_5m, macd_signal_5m = calculate_macd(closes_5m)
-
-        price_series_5m = [round(p, 8) for p in closes_5m[-10:]] if len(closes_5m) >= 10 else []
-
-        # === АНАЛИЗ 1-ЧАСОВОГО ТАЙМФРЕЙМА (среднесрочный тренд) ===
-        closes_1h = [k["close"] for k in klines_1h] if klines_1h else []
-        volumes_1h = [k["volume"] for k in klines_1h] if klines_1h else []
-
-        ema20_1h = calculate_ema(closes_1h, 20) if len(closes_1h) >= 20 else 0
-        ema50_1h = calculate_ema(closes_1h, 50) if len(closes_1h) >= 50 else 0
-        rsi14_1h = calculate_rsi(closes_1h, 14) if len(closes_1h) >= 15 else 50
-        macd_1h, macd_signal_1h = calculate_macd(closes_1h)
-
-        # ATR with Wilder smoothing, consistent with the RSI implementation.
-        atr14_1h = calculate_atr(klines_1h)
-
-        avg_volume_1h = np.mean(volumes_1h[-20:]) if len(volumes_1h) >= 20 else 0
-
-        price_series_1h = [round(p, 8) for p in closes_1h[-10:]] if len(closes_1h) >= 10 else []
-
-        # === АНАЛИЗ 4-ЧАСОВОГО ТАЙМФРЕЙМА (долгосрочный контекст) ===
-        closes_4h = [k["close"] for k in klines_4h] if klines_4h else []
-
-        ema20_4h = calculate_ema(closes_4h, 20) if len(closes_4h) >= 20 else 0
-        ema50_4h = calculate_ema(closes_4h, 50) if len(closes_4h) >= 50 else 0
-        rsi14_4h = calculate_rsi(closes_4h, 14) if len(closes_4h) >= 15 else 50
-        macd_4h, macd_signal_4h = calculate_macd(closes_4h)
-
-        # MACD серия для 4h (последние 10 точек)
-        macd_series_4h = []
-        for i in range(max(0, len(closes_4h) - 10), len(closes_4h)):
-            subset = closes_4h[:i+1]
-            if len(subset) >= 34:
-                macd_val, _ = calculate_macd(subset)
-                macd_series_4h.append(round(macd_val, 3))
-
-        analysis = {
-            "current_price": current_price,
-
-            # 3-МИНУТНЫЙ ТАЙМФРЕЙМ (текущий момент)
-            "timeframe_3m": {
-                "ema20": round(ema20_3m, 2),
-                "ema50": round(ema50_3m, 2),
-                "macd": round(macd_3m, 3),
-                "macd_signal": round(macd_signal_3m, 3),
-                "macd_histogram": round(macd_3m - macd_signal_3m, 3),
-                "rsi14": round(rsi14_3m, 3),
-                "avg_volume": round(avg_volume_3m, 3),
-                "current_volume": round(current_volume_3m, 3),
-                "price_series": price_series_3m,
-            },
-
-            # 5-МИНУТНЫЙ ТАЙМФРЕЙМ (краткосрочный)
-            "timeframe_5m": {
-                "ema20": round(ema20_5m, 2),
-                "ema50": round(ema50_5m, 2),
-                "macd": round(macd_5m, 3),
-                "macd_signal": round(macd_signal_5m, 3),
-                "macd_histogram": round(macd_5m - macd_signal_5m, 3),
-                "rsi14": round(rsi14_5m, 3),
-                "price_series": price_series_5m,
-            },
-
-            # 1-ЧАСОВОЙ ТАЙМФРЕЙМ (среднесрочный)
-            "timeframe_1h": {
-                "ema20": round(ema20_1h, 2),
-                "ema50": round(ema50_1h, 2),
-                "macd": round(macd_1h, 3),
-                "macd_signal": round(macd_signal_1h, 3),
-                "macd_histogram": round(macd_1h - macd_signal_1h, 3),
-                "rsi14": round(rsi14_1h, 3),
-                "atr14": round(atr14_1h, 2),
-                "avg_volume": round(avg_volume_1h, 3),
-                "current_volume": round(volumes_1h[-1], 3) if volumes_1h else 0,
-                "price_series": price_series_1h,
-            },
-
-            # 4-ЧАСОВОЙ ТАЙМФРЕЙМ (долгосрочный контекст)
-            "timeframe_4h": {
-                "ema20": round(ema20_4h, 2),
-                "ema50": round(ema50_4h, 2),
-                "macd": round(macd_4h, 3),
-                "macd_signal": round(macd_signal_4h, 3),
-                "macd_histogram": round(macd_4h - macd_signal_4h, 3),
-                "rsi14": round(rsi14_4h, 3),
-                "macd_series": macd_series_4h,
-            },
+        datasets = {
+            "timeframe_3m": get_kline_data(bybit, symbol, "3", 100),
+            "timeframe_5m": get_kline_data(bybit, symbol, "5", 100),
+            "timeframe_1h": get_kline_data(bybit, symbol, "60", 100),
+            "timeframe_4h": get_kline_data(bybit, symbol, "240", 60),
         }
-
+        incomplete = [name for name, candles in datasets.items() if len(candles) < 50]
+        if incomplete:
+            return {"error": f"incomplete_timeframes:{','.join(incomplete)}", "complete": False}
+        now_ms = int(time.time() * 1_000)
+        frames = {
+            name: _timeframe_features(candles, now_ms)
+            for name, candles in datasets.items()
+        }
+        analysis = {
+            "current_price": float(current_price),
+            "complete": True,
+            "as_of_ms": now_ms,
+            "regime": _regime(frames),
+            **frames,
+        }
         _analysis_cache[symbol] = (now, analysis)
         return analysis
+    except Exception as error:
+        logger.error(f"Ошибка анализа рынка для {symbol}: {error}")
+        return {"error": str(error), "complete": False}
 
-    except Exception as e:
-        logger.error(f"Ошибка анализа рынка для {symbol}: {e}")
-        return {"error": str(e)}
 
-
-def enrich_context_with_market_data(bybit: BybitAPI, context: dict, tokens: List[str]) -> dict:
-    """
-    Обогащает контекст техническими индикаторами для каждого токена
-    """
-    market_analysis = {}
-
+def enrich_context_with_market_data(
+    bybit: BybitAPI,
+    context: dict,
+    tokens: List[str],
+) -> dict:
+    market_analysis: dict[str, dict] = {}
     for token in tokens:
         symbol = f"{token}USDT"
-
-        # Получаем текущую цену из контекста
         current_price = context.get("prices", {}).get(symbol, {}).get("lastPrice")
-
         if not current_price:
-            logger.warning(f"Нет цены для {symbol}, пропускаем анализ")
+            logger.warning(f"Нет цены для {symbol}, анализ пропущен")
             continue
-
-        logger.debug(f"Получаю рыночный анализ для {token}...")
-        analysis = get_market_analysis(bybit, symbol, current_price)
-
-        if "error" not in analysis:
+        analysis = get_market_analysis(bybit, symbol, float(current_price))
+        if analysis.get("complete"):
             market_analysis[token] = analysis
         else:
-            logger.warning(f"Ошибка анализа {token}: {analysis['error']}")
-
-    # Добавляем в контекст
+            logger.warning(f"Неполный анализ {token}: {analysis.get('error', 'unknown')}")
     context["market_analysis"] = market_analysis
-
     return context

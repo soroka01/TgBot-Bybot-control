@@ -1,696 +1,1388 @@
-# core/auto_trading.py
-"""
-Автоматический торговый бот для Bybit с использованием DeepSeek AI
-"""
+"""Auto-trading orchestration with deterministic candidates and risk controls."""
+
+from __future__ import annotations
+
+import hashlib
+import threading
 import time
 import traceback
-import sys
-from pathlib import Path
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from typing import Any, Optional
 
-# Добавляем корневую директорию в путь
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from utils.logger_setup import logger
-from config import (
-    POLL_INTERVAL, TRADABLE_TOKENS, DRY_RUN, MAX_LEVERAGE
+from api.bybit_api import (
+    BybitAPI,
+    BybitAPIError,
+    BybitOrderConfirmationError,
+    BybitOrderNotFilledError,
+    TERMINAL_ORDER_STATUSES,
 )
-from api.bybit_api import BybitAPI, BybitAPIError
 from api.deepseek_api import DeepSeekAPI
 from api.tg_notify import notify
-from core.market_data import enrich_context_with_market_data
-from utils.helpers import (
-    build_context, validate_deepseek_json,
-    validate_trade_risk, validate_sl_vs_liquidation,
-    calculate_position_risk, calculate_position_roi,
-    find_unprotected_positions, parse_account_overview,
-    round_quantity, to_float
+from config import (
+    DRY_RUN,
+    BYBIT_MAX_SLIPPAGE_PERCENT,
+    FALLBACK_TAKER_FEE_RATE,
+    MAX_DAILY_LOSS_PERCENT,
+    POLL_INTERVAL,
+    TP_SL_MIN_CHANGE_PERCENT,
+    TRADABLE_TOKENS,
+    validate_config,
 )
-from core.prompt_builder import build_deepseek_prompt, get_prompt_summary
+from core.decision_engine import (
+    build_selector_prompt,
+    build_trade_snapshot,
+    selected_candidate,
+    validate_trade_decision,
+)
+from core.market_data import get_market_analysis
+from core.risk_engine import D, TradePlan, build_trade_plan, portfolio_risk_usd
+from storage.database import get_store
+from utils.helpers import parse_account_overview, validate_sl_vs_liquidation
+from utils.logger_setup import logger
 
-def symbol_to_pair(token: str) -> str:
-    """Конвертирует токен в пару для Bybit"""
-    return f"{token}USDT"
 
-def execute_decision(bybit: BybitAPI, decision: dict, account_info: dict):
-    """
-    Выполняет торговые решения от DeepSeek на Bybit
-    """
-    # Вычисляем текущий риск портфеля
-    positions_data = bybit.get_positions()
-    positions_list = positions_data.get("result", {}).get("list", [])
+# All exchange mutations, including manual Telegram closes, share this lock.
+EXECUTION_LOCK = threading.RLock()
+FEE_REFRESH_SECONDS = 3_600
+MAX_SAFETY_CLOSE_ATTEMPTS = 3
+SUPPORTED_AUTO_MARGIN_MODES = {"REGULAR_MARGIN"}
+PARTIAL_TERMINAL_ORDER_STATUSES = {
+    "PartiallyFilledCanceled",
+    "PartiallyFilledCancelled",
+}
 
-    open_positions = [p for p in positions_list if to_float(p.get("size")) > 0]
-    current_total_risk = calculate_position_risk(open_positions)
-    unprotected_positions = find_unprotected_positions(open_positions)
-    available_balance = to_float(account_info.get("available_usd"))
-    risk_budget = to_float(account_info.get("equity_usd"), available_balance)
+_runtime_lock = threading.Lock()
+_runtime: dict[str, Any] = {
+    "state": "stopped",
+    "iteration": 0,
+    "last_cycle_at": None,
+    "last_snapshot_id": None,
+    "last_summary": "Ещё не запускался",
+    "last_error": None,
+}
 
-    logger.info(
-        f"Текущий риск портфеля до SL: ${current_total_risk:.2f}, "
-        f"доступно для маржи: ${available_balance:.2f}, equity: ${risk_budget:.2f}"
-    )
-    if unprotected_positions:
-        logger.warning(
-            f"Есть позиции без Stop Loss: {', '.join(unprotected_positions)}. "
-            "Новые входы будут заблокированы до их защиты."
-        )
-        notify("⚠️ Новые сделки пропущены: у открытых позиций нет защитного Stop Loss")
 
-    for coin, payload in decision.items():
-        args = payload.get("trade_signal_args", {})
-        sig = args.get("signal")
-        pair = symbol_to_pair(coin)
+class FatalExecutionError(RuntimeError):
+    """A live position may be unsafe; automation must stop immediately."""
 
+
+class ExecutionStopped(RuntimeError):
+    """The owner stopped automation before a new entry was submitted."""
+
+
+def execution_lock() -> threading.RLock:
+    return EXECUTION_LOCK
+
+
+def get_runtime_status() -> dict[str, Any]:
+    with _runtime_lock:
+        return dict(_runtime)
+
+
+def _set_runtime(**values: Any) -> None:
+    with _runtime_lock:
+        _runtime.update(values)
+
+
+def _ticker_rows(
+    bybit: BybitAPI,
+    tokens: list[str],
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for token in tokens:
+        symbol = f"{token}USDT"
+        response = bybit.get_tickers(symbol)
+        rows = response.get("result", {}).get("list", [])
+        if not rows:
+            raise BybitAPIError(f"Bybit не вернул ticker {symbol}")
+        result[symbol] = {
+            **rows[0],
+            "_snapshot_time_ms": int(response.get("time") or time.time() * 1_000),
+        }
+    return result
+
+
+def _fee_rates(
+    bybit: BybitAPI,
+    previous: Optional[dict[str, Decimal]] = None,
+) -> dict[str, Decimal]:
+    rates: dict[str, Decimal] = {}
+    previous = previous or {}
+    for token in TRADABLE_TOKENS:
+        symbol = f"{token}USDT"
         try:
-            if sig == "hold":
-                handle_hold_signal(bybit, coin, pair, args, positions_list)
+            rates[symbol] = bybit.get_fee_rate(symbol)
+        except Exception as error:
+            rates[symbol] = D(previous.get(symbol, FALLBACK_TAKER_FEE_RATE))
+            logger.warning(
+                f"{symbol}: не удалось получить персональную taker fee, "
+                f"использую {rates[symbol]}: {error}"
+            )
+    return rates
 
-            elif sig == "close":
-                handle_close_signal(bybit, coin, pair, args, positions_list)
 
-            elif sig in ("long", "short"):
-                if unprotected_positions:
-                    logger.warning(f"[{coin}] {sig.upper()} пропущен: портфель содержит позицию без SL")
-                    continue
-                reservation = handle_open_signal(
-                    bybit, coin, pair, sig, args, available_balance,
-                    current_total_risk, risk_budget
+def _realized_pnl_today(bybit: BybitAPI) -> Decimal:
+    now = datetime.now(timezone.utc)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    response = bybit.get_closed_pnl(
+        limit=100,
+        start_time=int(midnight.timestamp() * 1_000),
+        end_time=int(now.timestamp() * 1_000),
+        all_pages=True,
+    )
+    realized = sum(
+        (D(item.get("closedPnl", 0)) for item in response.get("result", {}).get("list", [])),
+        Decimal("0"),
+    )
+    return realized
+
+
+def _unsupported_derivative_exposure(bybit: BybitAPI) -> list[str]:
+    """Return account exposure that the USDT-linear risk model cannot size."""
+    exposure: list[str] = []
+    for category, settle_coin, label in (
+        ("linear", "USDC", "USDC linear"),
+        ("inverse", None, "inverse"),
+        ("option", None, "options"),
+    ):
+        positions = bybit.get_positions(
+            settle_coin=settle_coin,
+            category=category,
+        ).get("result", {}).get("list", [])
+        if any(abs(D(item.get("size", 0))) > 0 for item in positions):
+            exposure.append(f"{label} position")
+        orders = bybit.get_open_orders(
+            category=category,
+            settle_coin=settle_coin,
+        ).get("result", {}).get("list", [])
+        if any(item.get("reduceOnly") is not True for item in orders):
+            exposure.append(f"{label} order")
+    return exposure
+
+
+def _daily_drawdown_block_reason(
+    bybit: BybitAPI,
+    equity: Decimal,
+) -> Optional[str]:
+    """Update the account-scoped high-water mark and enforce its loss limit."""
+    account_scope = hashlib.sha256(
+        f"{bybit.base}|{bybit.api_key}".encode("utf-8")
+    ).hexdigest()[:24]
+    guard = get_store().update_daily_equity_guard(
+        float(equity),
+        scope=account_scope,
+    )
+    high_water = D(guard["high_water_equity"])
+    drawdown = D(guard["drawdown"])
+    daily_limit = high_water * D(MAX_DAILY_LOSS_PERCENT) / 100
+    if drawdown >= daily_limit and daily_limit > 0:
+        return (
+            f"Дневной equity drawdown ${drawdown:.2f} достиг лимита "
+            f"${daily_limit:.2f}"
+        )
+    return None
+
+
+def _entry_block_reason(
+    bybit: BybitAPI,
+    positions: list[dict[str, Any]],
+    account: dict[str, Any],
+    unprotected: list[str],
+) -> Optional[str]:
+    equity = D(account.get("equity_usd", 0))
+    if equity <= 0:
+        return "Equity аккаунта не положителен"
+    drawdown_reason = _daily_drawdown_block_reason(bybit, equity)
+    if drawdown_reason:
+        return drawdown_reason
+
+    try:
+        account_mode = bybit.get_account_info().get("result", {})
+    except Exception as error:
+        logger.warning(f"Entry gate: не удалось проверить режим аккаунта: {error}")
+        return "Не удалось проверить режим аккаунта Bybit"
+    if not isinstance(account_mode, dict):
+        return "Bybit вернул повреждённый режим аккаунта"
+    margin_mode = account_mode.get("marginMode")
+    if margin_mode not in SUPPORTED_AUTO_MARGIN_MODES:
+        return (
+            f"Режим маржи {margin_mode!r} не поддержан авто-режимом; "
+            "нужен REGULAR_MARGIN"
+        )
+    unified_status = account_mode.get("unifiedMarginStatus")
+    if (
+        isinstance(unified_status, bool)
+        or not isinstance(unified_status, int)
+        or unified_status not in {3, 4, 5, 6}
+    ):
+        return "Нужен Unified Trading Account"
+    try:
+        unsupported = _unsupported_derivative_exposure(bybit)
+    except Exception as error:
+        logger.warning(f"Entry gate: не удалось проверить прочие деривативы: {error}")
+        return "Не удалось проверить USDC/inverse/options exposure"
+    if unsupported:
+        return "Есть неподдерживаемая экспозиция: " + ", ".join(unsupported)
+    if unprotected:
+        return "Есть позиции без защитного Stop Loss: " + ", ".join(unprotected)
+    unsafe = [
+        str(position.get("symbol"))
+        for position in positions
+        if D(position.get("size", 0)) > 0
+        and (
+            position.get("positionStatus") not in {None, "", "Normal"}
+            or bool(position.get("isReduceOnly"))
+        )
+    ]
+    if unsafe:
+        return "Bybit ограничил позиции: " + ", ".join(sorted(set(unsafe)))
+    try:
+        open_orders = bybit.get_open_orders().get("result", {}).get("list", [])
+    except Exception as error:
+        logger.warning(f"Entry gate: не удалось проверить активные ордера: {error}")
+        return "Не удалось проверить активные ордера Bybit"
+    # /v5/order/realtime returns active orders.  Conditional `Untriggered`
+    # entries are exposure too, so do not maintain an incomplete status list.
+    exposed_orders = [
+        order for order in open_orders if order.get("reduceOnly") is not True
+    ]
+    if exposed_orders:
+        return "Есть активные увеличивающие позицию ордера"
+    try:
+        realized_pnl = _realized_pnl_today(bybit)
+    except Exception as error:
+        logger.warning(f"Entry gate: не удалось проверить дневной PnL: {error}")
+        return "Не удалось проверить дневной PnL Bybit"
+    if realized_pnl <= -(equity * D(MAX_DAILY_LOSS_PERCENT) / 100) and equity > 0:
+        return (
+            f"Дневной realized-loss лимит достигнут: ${realized_pnl:.2f}"
+        )
+    return None
+
+
+def collect_cycle(
+    bybit: BybitAPI,
+    fee_rates: dict[str, Decimal],
+    *,
+    tokens: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    selected_tokens = list(tokens or TRADABLE_TOKENS)
+    positions = [
+        position
+        for position in bybit.get_positions().get("result", {}).get("list", [])
+        if D(position.get("size", 0)) > 0
+    ]
+    account = parse_account_overview(
+        bybit.get_wallet_balance(),
+        strict=True,
+    )
+    ticker_rows = _ticker_rows(bybit, selected_tokens)
+    analyses: dict[str, dict[str, Any]] = {}
+    for token in selected_tokens:
+        symbol = f"{token}USDT"
+        analyses[token] = get_market_analysis(
+            bybit,
+            symbol,
+            float(D(ticker_rows[symbol].get("lastPrice", 0))),
+        )
+    conservative_fee = max(
+        [D(FALLBACK_TAKER_FEE_RATE), *fee_rates.values()]
+    )
+    risk, unprotected = portfolio_risk_usd(
+        positions,
+        taker_fee_rate=conservative_fee,
+    )
+    block_reason = _entry_block_reason(bybit, positions, account, unprotected)
+    snapshot = build_trade_snapshot(
+        tokens=selected_tokens,
+        positions=positions,
+        tickers=ticker_rows,
+        analyses=analyses,
+        fee_rates=fee_rates,
+        allow_entries=block_reason is None,
+        entry_block_reason=block_reason,
+    )
+    return {
+        "positions": positions,
+        "account": account,
+        "tickers": ticker_rows,
+        "analyses": analyses,
+        "portfolio_risk": risk,
+        "entry_block_reason": block_reason,
+        "snapshot": snapshot,
+    }
+
+
+def _fresh_entry_state(
+    bybit: BybitAPI,
+    fee_rates: dict[str, Decimal],
+) -> dict[str, Any]:
+    """Recheck all mutable account exposure immediately before an entry."""
+    positions = [
+        position
+        for position in bybit.get_positions().get("result", {}).get("list", [])
+        if D(position.get("size", 0)) > 0
+    ]
+    account = parse_account_overview(
+        bybit.get_wallet_balance(),
+        strict=True,
+    )
+    conservative_fee = max(
+        [D(FALLBACK_TAKER_FEE_RATE), *fee_rates.values()]
+    )
+    risk, unprotected = portfolio_risk_usd(
+        positions,
+        taker_fee_rate=conservative_fee,
+    )
+    block_reason = _entry_block_reason(bybit, positions, account, unprotected)
+    return {
+        "positions": positions,
+        "account": account,
+        "portfolio_risk": risk,
+        "entry_block_reason": block_reason,
+    }
+
+
+def _final_entry_state(
+    bybit: BybitAPI,
+    fee_rates: dict[str, Decimal],
+) -> dict[str, Any]:
+    """Re-read all USDT exposure used for sizing just before order creation."""
+    position_rows = (
+        bybit.get_positions().get("result", {}).get("list", [])
+    )
+    positions = [
+        position
+        for position in position_rows
+        if D(position.get("size", 0)) > 0
+    ]
+    open_orders = (
+        bybit.get_open_orders().get("result", {}).get("list", [])
+    )
+    account = parse_account_overview(
+        bybit.get_wallet_balance(),
+        strict=True,
+    )
+    conservative_fee = max(
+        [D(FALLBACK_TAKER_FEE_RATE), *fee_rates.values()]
+    )
+    risk, unprotected = portfolio_risk_usd(
+        positions,
+        taker_fee_rate=conservative_fee,
+    )
+
+    block_reason: Optional[str] = None
+    equity = D(account.get("equity_usd", 0))
+    if equity <= 0:
+        block_reason = "Equity аккаунта не положителен"
+    else:
+        block_reason = _daily_drawdown_block_reason(bybit, equity)
+    if block_reason is None:
+        if D(account.get("available_usd", 0)) <= 0:
+            block_reason = "Нет доступной маржи для новой позиции"
+        elif unprotected:
+            block_reason = (
+                "Есть позиции без безопасного Stop Loss: "
+                + ", ".join(unprotected)
+            )
+        else:
+            unsafe = [
+                str(position.get("symbol"))
+                for position in positions
+                if (
+                    position.get("positionStatus") not in {None, "", "Normal"}
+                    or bool(position.get("isReduceOnly"))
                 )
-                if reservation:
-                    current_total_risk += reservation["risk_usd"]
-                    available_balance = max(
-                        0.0, available_balance - reservation["margin_with_buffer"]
-                    )
+            ]
+            if unsafe:
+                block_reason = (
+                    "Bybit ограничил позиции: "
+                    + ", ".join(sorted(set(unsafe)))
+                )
+            elif any(
+                order.get("reduceOnly") is not True
+                for order in open_orders
+            ):
+                block_reason = (
+                    "Есть активные увеличивающие позицию ордера"
+                )
 
-            else:
-                logger.warning(f"[{coin}] Неизвестный сигнал: {sig}")
-                notify(f"[{coin}] ⚠️ Неизвестный сигнал: {sig}")
-
-        except BybitAPIError as e:
-            logger.error(f"[{coin}] Ошибка Bybit API: {e}")
-            notify(f"[{coin}] ❌ Ошибка API: {e}")
-        except Exception as e:
-            logger.error(f"[{coin}] Ошибка при исполнении: {e}")
-            logger.debug(traceback.format_exc())
-            notify(f"[{coin}] ❌ Ошибка: {e}")
+    return {
+        "positions": positions,
+        "account": account,
+        "portfolio_risk": risk,
+        "entry_block_reason": block_reason,
+    }
 
 
-def handle_hold_signal(bybit: BybitAPI, coin: str, pair: str, args: dict, positions_list: list):
-    """Обработка сигнала HOLD - удержание позиции с обновлением TP/SL"""
-    matching_positions = [
-        p for p in positions_list if p.get("symbol") == pair and to_float(p.get("size")) > 0
-    ]
-    if len(matching_positions) > 1:
-        logger.warning(f"[{coin}] HOLD пропущен: по {pair} открыты обе стороны hedge-позиции")
-        notify(f"[{coin}] ⚠️ HOLD пропущен: одновременно открыты LONG и SHORT")
-        return
-    current_pos = matching_positions[0] if matching_positions else None
-
-    if not current_pos or float(current_pos.get("size", 0)) == 0:
-        logger.info(f"[{coin}] HOLD: позиции нет — пропуск")
-        return
-
-    qty = to_float(current_pos.get("size"))
-    entry_price = to_float(current_pos.get("entryPrice"))
-    side = current_pos.get("side", "")
-    leverage = int(current_pos.get("leverage", 1))
-
-    # Определяем position_idx на основе positionIdx из Bybit
-    # 0 = one-way mode, 1 = hedge Buy side, 2 = hedge Sell side
-    position_idx = int(current_pos.get("positionIdx", 0))
-
-    # Получаем текущую цену
-    ticker_data = bybit.get_tickers(pair)
-    last_price = float(ticker_data["result"]["list"][0]["lastPrice"])
-
-    # TP/SL из DeepSeek
-    tp = to_float(args.get("profit_target")) or None
-    sl = to_float(args.get("stop_loss")) or None
-
-    # Never guess by swapping invalid AI values: that can silently set an
-    # unintended protective order. Reject the malformed update instead.
-    if side == "Buy" and ((tp is not None and tp <= last_price) or (sl is not None and sl >= last_price)):
-        logger.error(f"[{coin}] Некорректный TP/SL для LONG: TP={tp}, SL={sl}, цена={last_price}")
-        return
-    if side == "Sell" and ((tp is not None and tp >= last_price) or (sl is not None and sl <= last_price)):
-        logger.error(f"[{coin}] Некорректный TP/SL для SHORT: TP={tp}, SL={sl}, цена={last_price}")
-        return
-
-    # Валидация SL относительно ликвидации (строгая проверка)
-    liq_price = float(current_pos.get("liqPrice", 0) or 0)
-    if liq_price > 0 and sl:
-        is_valid, error_msg = validate_sl_vs_liquidation(
-            side=side,
-            stop_loss=sl,
-            liquidation_price=liq_price,
-            min_distance_percent=5.0  # Минимум 5% от ликвидации
-        )
-        if not is_valid:
-            logger.error(f"[{coin}] {error_msg}")
-            logger.warning(f"[{coin}] Обновлю только TP, SL пропущен из-за близости к ликвидации")
-            notify(f"[{coin}] ⚠️ {error_msg}\n⚠️ Обновлен только TP, SL оставлен прежним!")
-            sl = None  # Отключаем обновление SL
-
-    # Рассчитываем текущую прибыль/убыток
-    position_value = qty * last_price  # Общая сумма позиции
-    margin_used = position_value / leverage  # Чистая маржа из кошелька
-    unrealized_pnl = to_float(current_pos.get("unrealisedPnl"))
-    unrealized_pnl_percent = calculate_position_roi(unrealized_pnl, qty, entry_price, leverage)
-
-    # Получаем текущие TP/SL из позиции
-    current_tp = float(current_pos.get("takeProfit", 0) or 0)
-    current_sl = float(current_pos.get("stopLoss", 0) or 0)
-
-    # Проверяем, изменились ли TP/SL
-    def price_changed(new_value, old_value):
-        return new_value is not None and abs(new_value - old_value) > max(1e-8, abs(old_value) * 1e-6)
-
-    tp_changed = price_changed(tp, current_tp)
-    sl_changed = price_changed(sl, current_sl)
-
-    # Если ничего не изменилось, пропускаем
-    if not tp_changed and not sl_changed:
-        logger.info(f"[{coin}] TP/SL не изменились (TP={current_tp}, SL={current_sl}), пропускаю обновление")
-        return
-
-    # Если хотя бы один параметр изменился, продолжаем
-    if tp_changed:
-        logger.info(f"[{coin}] TP изменился: {current_tp} → {tp}")
-    if sl_changed:
-        logger.info(f"[{coin}] SL изменился: {current_sl} → {sl}")
-
-    # Потенциальная прибыль/убыток до TP/SL
-    if tp and sl:
-        if side == "Buy":  # LONG
-            potential_profit = (tp - last_price) * qty if tp > last_price else 0
-            potential_loss = (last_price - sl) * qty if sl < last_price else 0
-        else:  # SHORT
-            potential_profit = (last_price - tp) * qty if tp < last_price else 0
-            potential_loss = (sl - last_price) * qty if sl > last_price else 0
-    else:
-        potential_profit = 0
-        potential_loss = 0
-
-    # Формируем строку для обновления
-    update_info = []
-    if tp:
-        update_info.append(f"TP={tp}")
-    if sl:
-        update_info.append(f"SL={sl}")
-    update_str = ", ".join(update_info) if update_info else "нет изменений"
-
-    logger.info(f"[{coin}] HOLD: qty={qty}, entry={entry_price}, side={side}, position_idx={position_idx}, обновление: {update_str}")
-    logger.info(f"[{coin}] Текущий PnL: ${unrealized_pnl:.2f} ({unrealized_pnl_percent:+.2f}%), Потенциал: +${potential_profit:.2f}/-${potential_loss:.2f}")
-
-    if DRY_RUN:
-        logger.info(f"[DRY_RUN] {coin} HOLD: обновление {update_str}")
-        tp_line = f"🎯 TP: ${tp} (+${potential_profit:.2f})" if tp else f"🎯 TP: ${current_tp} (без изменений)"
-        sl_line = f"🛑 SL: ${sl} (-${potential_loss:.2f})" if sl else f"🛑 SL: ${current_sl} (без изменений)"
-        notify(
-            f"[{coin}] 📊 HOLD (DRY): {side}\n"
-            f"💰 Размер: {qty} @ ${last_price:.2f}\n"
-            f"📊 Сумма: ${position_value:.2f} (маржа: ${margin_used:.2f})\n"
-            f"⚡ Плечо: {leverage}x\n"
-            f"📈 PnL: ${unrealized_pnl:.2f} ({unrealized_pnl_percent:+.2f}%)\n"
-            f"{tp_line}\n"
-            f"{sl_line}"
-        )
-    else:
-        resp = bybit.set_trading_stop(symbol=pair, position_idx=position_idx, take_profit=tp, stop_loss=sl)
-        logger.info(f"[{coin}] Установлены: {resp}")
-        tp_line = f"🎯 TP: ${tp} (+${potential_profit:.2f})" if tp else f"🎯 TP: ${current_tp} (без изменений)"
-        sl_line = f"🛑 SL: ${sl} (-${potential_loss:.2f})" if sl else f"🛑 SL: ${current_sl} (без изменений)"
-        notify(
-            f"[{coin}] 📊 HOLD: {side}\n"
-            f"💰 Размер: {qty} @ ${last_price:.2f}\n"
-            f"📊 Сумма: ${position_value:.2f} (маржа: ${margin_used:.2f})\n"
-            f"⚡ Плечо: {leverage}x\n"
-            f"📈 PnL: ${unrealized_pnl:.2f} ({unrealized_pnl_percent:+.2f}%)\n"
-            f"{tp_line}\n"
-            f"{sl_line}"
-        )
-
-def handle_close_signal(bybit: BybitAPI, coin: str, pair: str, args: dict, positions_list: list):
-    """Обработка сигнала CLOSE - закрытие позиции"""
-    matching_positions = [
-        p for p in positions_list if p.get("symbol") == pair and to_float(p.get("size")) > 0
-    ]
-    if len(matching_positions) > 1:
-        logger.warning(f"[{coin}] CLOSE пропущен: по {pair} открыта hedge-пара, требуется ручное решение")
-        notify(f"[{coin}] ⚠️ CLOSE пропущен: одновременно открыты LONG и SHORT")
-        return
-    current_pos = matching_positions[0] if matching_positions else None
-
-    if not current_pos or float(current_pos.get("size", 0)) == 0:
-        logger.info(f"[{coin}] CLOSE: позиции нет — пропуск")
-        return
-
-    side = current_pos.get("side", "")
-    qty = float(current_pos.get("size", 0))
-    entry_price = to_float(current_pos.get("avgPrice", current_pos.get("entryPrice")))
-    unrealized_pnl = to_float(current_pos.get("unrealisedPnl"))
-    position_idx = int(current_pos.get("positionIdx", 0))
-
-    # Получаем текущую цену для расчетов
-    ticker_data = bybit.get_tickers(pair)
-    current_price = float(ticker_data["result"]["list"][0]["lastPrice"])
-
-    position_value = qty * current_price
-    unrealized_pnl_percent = calculate_position_roi(
-        unrealized_pnl, qty, entry_price, to_float(current_pos.get("leverage"), 1)
-    )
-
-    # Определяем сторону для закрытия
-    close_side = "Sell" if side == "Buy" else "Buy"
-
-    logger.info(f"[{coin}] CLOSE: закрываем {side} позицию qty={qty}, position_idx={position_idx}, PnL=${unrealized_pnl:.2f}")
-
-    if DRY_RUN:
-        logger.info(f"[DRY_RUN] {coin} CLOSE: market order {close_side} qty={qty}")
-        notify(
-            f"[{coin}] 🔴 CLOSE (DRY): {side}\n"
-            f"💰 Закрыто: {qty} @ ${current_price:.2f}\n"
-            f"📊 Вход был: ${entry_price:.2f}\n"
-            f"💵 Итог: ${unrealized_pnl:+.2f} ({unrealized_pnl_percent:+.2f}%)"
-        )
-    else:
-        resp = bybit.close_position_market(symbol=pair, side=close_side, position_idx=position_idx)
-        logger.info(f"[{coin}] Позиция закрыта: {resp}")
-        notify(
-            f"[{coin}] 🔴 CLOSE: {side}\n"
-            f"💰 Закрыто: {qty} @ ${current_price:.2f}\n"
-            f"📊 Вход был: ${entry_price:.2f}\n"
-            f"💵 Итог: ${unrealized_pnl:+.2f} ({unrealized_pnl_percent:+.2f}%)"
-        )
-
-def handle_open_signal(bybit: BybitAPI, coin: str, pair: str, sig: str, args: dict,
-                       available_balance: float, current_total_risk: float,
-                       risk_budget: float):
-    """Обработка сигналов LONG/SHORT - открытие новой позиции"""
-    qty = to_float(args.get("quantity"))
-    tp = to_float(args.get("profit_target"))
-    sl = to_float(args.get("stop_loss"))
-    leverage = int(to_float(args.get("leverage"), 1))
-    confidence = to_float(args.get("confidence"))
-
-    if qty <= 0:
-        logger.info(f"[{coin}] {sig.upper()}: quantity не указан — пропуск")
-        return
-
-    # Округляем quantity согласно требованиям биржи
-    qty_original = qty
-    qty = round_quantity(coin, qty)
-
-    if qty == 0:
-        logger.warning(f"[{coin}] {sig.upper()}: quantity {qty_original} слишком мал после округления — пропуск")
-        notify(f"[{coin}] ⚠️ {sig.upper()}: размер {qty_original} слишком мал (мин. требования биржи)")
-        return
-
-    if qty != qty_original:
-        logger.info(f"[{coin}] Количество округлено: {qty_original} → {qty}")
-
-    # Получаем текущую цену
-    ticker_data = bybit.get_tickers(pair)
-    last_price = float(ticker_data["result"]["list"][0]["lastPrice"])
-
-    side = "Buy" if sig == "long" else "Sell"
-
-    # Валидация маржи, направлений TP/SL, реального риска и R/R.
-    is_valid, error_msg = validate_trade_risk(
-        quantity=qty,
-        price=last_price,
-        stop_loss=sl,
-        leverage=leverage,
-        available_balance=available_balance,
-        total_risk_usd=current_total_risk,
-        side=side,
-        profit_target=tp,
-        risk_budget_usd=risk_budget,
-    )
-
-    if not is_valid:
-        logger.warning(f"[{coin}] {sig.upper()} отклонен: {error_msg}")
-        notify(f"[{coin}] ⚠️ {sig.upper()} отклонен: {error_msg}")
-        return
-
-    # Определяем position_idx для hedge mode
-    # Проверяем существующие позиции чтобы узнать режим торговли
-    positions_data = bybit.get_positions(symbol=pair)
-    positions_list = positions_data.get("result", {}).get("list", [])
-
-    existing_same_side = next(
+def _open_position(
+    bybit: BybitAPI,
+    symbol: str,
+    position_idx: int,
+) -> Optional[dict[str, Any]]:
+    rows = bybit.get_positions(symbol=symbol).get("result", {}).get("list", [])
+    return next(
         (
-            position for position in positions_list
-            if position.get("symbol") == pair
-            and position.get("side") == side
-            and to_float(position.get("size")) > 0
+            item
+            for item in rows
+            if int(item.get("positionIdx", 0)) == int(position_idx)
+            and D(item.get("size", 0)) > 0
         ),
         None,
     )
-    if existing_same_side:
-        logger.warning(f"[{coin}] {sig.upper()} пропущен: позиция в том же направлении уже открыта")
-        notify(f"[{coin}] ℹ️ {sig.upper()} пропущен: позиция в этом направлении уже есть")
-        return
 
-    # КРИТИЧЕСКАЯ ПРОВЕРКА: если есть противоположная позиция, сначала закрываем её
-    opposite_side = "Sell" if side == "Buy" else "Buy"
-    existing_opposite = next(
-        (p for p in positions_list
-         if p.get("symbol") == pair
-         and p.get("side") == opposite_side
-         and float(p.get("size", 0)) > 0),
-        None
-    )
 
-    if existing_opposite:
+def _confirmed_safety_flatten(
+    bybit: BybitAPI,
+    *,
+    symbol: str,
+    side: str,
+    position_idx: int,
+    reason: str,
+    order_prefix: str,
+) -> bool:
+    """Close a position with bounded retries; return True only for DRY preview."""
+    current_side = side
+    last_error: Optional[Exception] = None
+    for attempt in range(1, MAX_SAFETY_CLOSE_ATTEMPTS + 1):
+        if current_side not in {"Buy", "Sell"}:
+            raise FatalExecutionError(
+                f"{symbol}: неизвестна сторона позиции при аварийном закрытии"
+            )
+        order_link_id = bybit.new_order_link_id(order_prefix)
+        try:
+            result = bybit.close_position_market(
+                symbol,
+                "Sell" if current_side == "Buy" else "Buy",
+                position_idx,
+                order_link_id=order_link_id,
+            )
+        except BybitOrderConfirmationError as error:
+            # The reduce-only order can still be live.  A second order would
+            # make the outcome harder to reconcile, so fail-stop immediately.
+            raise FatalExecutionError(
+                f"{symbol}: итог аварийного reduce-only ордера {order_link_id} неизвестен"
+            ) from error
+        except BybitOrderNotFilledError as error:
+            # IOC is terminal, so it is safe to read the remainder and submit
+            # a fresh reduce-only order with another stable ID.
+            last_error = error
+        except BybitAPIError as error:
+            last_error = error
+        except Exception as error:
+            raise FatalExecutionError(
+                f"{symbol}: аварийное закрытие завершилось неопределённой ошибкой"
+            ) from error
+        else:
+            if result.get("simulated"):
+                return True
+
+        try:
+            remainder = _open_position(bybit, symbol, position_idx)
+        except Exception as error:
+            raise FatalExecutionError(
+                f"{symbol}: невозможно подтвердить остаток после аварийного закрытия"
+            ) from error
+        if not remainder:
+            return False
+        current_side = str(remainder.get("side", current_side))
         logger.warning(
-            f"[{coin}] Обнаружена противоположная позиция {opposite_side}! "
-            f"Сначала закрываем её перед открытием {side}"
+            f"{symbol}: после safety-close попытки {attempt}/"
+            f"{MAX_SAFETY_CLOSE_ATTEMPTS} остался size={remainder.get('size')}; "
+            f"причина: {reason}"
         )
 
-        # Закрываем противоположную позицию
-        try:
-            existing_qty = float(existing_opposite.get("size", 0))
-            existing_idx = int(existing_opposite.get("positionIdx", 0))
+    raise FatalExecutionError(
+        f"{symbol}: после {MAX_SAFETY_CLOSE_ATTEMPTS} confirmed safety-close "
+        f"попыток позиция осталась открыта"
+    ) from last_error
 
-            logger.info(f"[{coin}] Закрываю {opposite_side} позицию qty={existing_qty} перед открытием {side}")
 
-            close_result = bybit.close_position_market(
-                symbol=pair,
-                side="Buy" if opposite_side == "Sell" else "Sell",
-                position_idx=existing_idx
-            )
-
-            logger.info(f"[{coin}] ✅ Противоположная позиция закрыта: {close_result}")
-            notify(
-                f"[{coin}] 🔄 Разворот позиции\n"
-                f"❌ Закрыта {opposite_side} позиция\n"
-                f"Открываю {side}..."
-            )
-
-            # Обновляем список позиций после закрытия
-            import time
-            time.sleep(0.5)  # Небольшая задержка чтобы биржа обработала закрытие
-
-            positions_data = bybit.get_positions(symbol=pair)
-            positions_list = positions_data.get("result", {}).get("list", [])
-
-        except Exception as e:
-            logger.error(f"[{coin}] ❌ Ошибка закрытия противоположной позиции: {e}")
-            notify(f"[{coin}] ❌ Не удалось закрыть {opposite_side} позицию: {e}")
-            return  # Прерываем открытие новой позиции
-
-    # Определяем position_idx на основе существующих позиций
-    # Если у нас есть позиции с positionIdx > 0, значит hedge mode
-    position_idx = 0  # По умолчанию one-way mode
-    if positions_list:
-        # Проверяем максимальный positionIdx
-        max_idx = max(int(p.get("positionIdx", 0)) for p in positions_list)
-        if max_idx > 0:
-            # Hedge mode активен
-            # 1 = Buy, 2 = Sell
-            position_idx = 1 if side == "Buy" else 2
-            logger.info(f"[{coin}] Hedge mode обнаружен, использую position_idx={position_idx} для {side}")
-
-    # Рассчитываем суммы
-    position_size_usd = qty * last_price
-    margin_required = position_size_usd / leverage
-    margin_with_buffer = margin_required * 1.10
-    actual_risk_usd = abs(last_price - sl) * qty
-
-    # Потенциальная прибыль и убыток
-    if sig == "long":
-        potential_profit_usd = (tp - last_price) * qty if tp else 0
-        potential_loss_usd = (last_price - sl) * qty if sl else 0
-    else:  # short
-        potential_profit_usd = (last_price - tp) * qty if tp else 0
-        potential_loss_usd = (sl - last_price) * qty if sl else 0
-
-    risk_reward_ratio = (potential_profit_usd / potential_loss_usd) if potential_loss_usd > 0 else 0
-
-    logger.info(
-        f"[{coin}] {sig.upper()}: side={side}, qty={qty}, "
-        f"TP={tp}, SL={sl}, leverage={leverage}, confidence={confidence:.2f}"
+def _close_for_safety(
+    bybit: BybitAPI,
+    *,
+    symbol: str,
+    side: str,
+    position_idx: int,
+    reason: str,
+    order_prefix: str,
+) -> str:
+    logger.critical(f"{symbol}: {reason}; выполняю confirmed reduce-only закрытие")
+    preview = _confirmed_safety_flatten(
+        bybit,
+        symbol=symbol,
+        side=side,
+        position_idx=position_idx,
+        reason=reason,
+        order_prefix=order_prefix,
     )
-    logger.info(
-        f"[{coin}] Сумма позиции: ${position_size_usd:.2f}, "
-        f"Маржа: ${margin_required:.2f}, R/R: {risk_reward_ratio:.2f}"
+    notify(
+        f"[{symbol}] "
+        f"{'🧪' if preview else '✅'} Safety-close: "
+        f"{'закрытие рассчитано' if preview else 'позиция закрыта'}\n"
+        f"Причина: {reason}"
     )
+    return "closed"
 
-    if DRY_RUN:
-        logger.info(
-            f"[DRY_RUN] {coin} {sig.upper()}: открытие {side} "
-            f"qty={qty} TP={tp} SL={sl} leverage={leverage}"
-        )
-        notify(
-            f"[{coin}] 🟢 {sig.upper()} (DRY): {side}\n"
-            f"💰 Размер: {qty} @ ${last_price:.2f}\n"
-            f"📊 Сумма: ${position_size_usd:.2f} (маржа: ${margin_required:.2f})\n"
-            f"⚡ Плечо: {leverage}x\n"
-            f"🎯 TP: ${tp} (+${potential_profit_usd:.2f})\n"
-            f"🛑 SL: ${sl} (-${potential_loss_usd:.2f})\n"
-            f"📈 R/R: {risk_reward_ratio:.2f} | Уверенность: {confidence:.0%}"
-        )
-        return {"risk_usd": actual_risk_usd, "margin_with_buffer": margin_with_buffer}
-    else:
-        # Устанавливаем leverage
-        try:
-            bybit.set_leverage(symbol=pair, buy_leverage=leverage, sell_leverage=leverage)
-            logger.info(f"[{coin}] Leverage установлен: {leverage}x")
-        except BybitAPIError as e:
-            # Ошибка 110043 означает что leverage уже установлен
-            if e.code == 110043:
-                logger.info(f"[{coin}] Leverage уже установлен на {leverage}x")
-            else:
-                logger.warning(f"[{coin}] Не удалось установить leverage: {e}")
-        except Exception as e:
-            logger.warning(f"[{coin}] Не удалось установить leverage: {e}")
 
-        # Создаем ордер с TP/SL
-        try:
-            resp = bybit.create_order(
-                symbol=pair,
+def _manage_protection(
+    bybit: BybitAPI,
+    position: dict[str, Any],
+    analysis: dict[str, Any],
+) -> Optional[str]:
+    """Tighten a stop deterministically; never widen it or update one side alone."""
+    try:
+        symbol = str(position["symbol"]).strip().upper()
+        side = str(position["side"])
+        position_idx = int(position.get("positionIdx", 0))
+        mark = D(position.get("markPrice") or analysis.get("current_price") or 0)
+        entry = D(position.get("avgPrice") or position.get("entryPrice") or 0)
+        current_stop = D(position.get("stopLoss") or 0)
+        current_target = D(position.get("takeProfit") or 0)
+        liquidation = D(position.get("liqPrice") or 0)
+    except (KeyError, TypeError, ValueError, BybitAPIError) as error:
+        raise FatalExecutionError(
+            "Bybit вернул позицию с повреждённым защитным состоянием"
+        ) from error
+    if not symbol:
+        raise FatalExecutionError("Bybit вернул позицию без symbol")
+    if side not in {"Buy", "Sell"}:
+        raise FatalExecutionError(f"{symbol}: неизвестная сторона позиции {side!r}")
+    mandatory_stop_repair = current_stop <= 0
+    if mark <= 0:
+        if mandatory_stop_repair:
+            return _close_for_safety(
+                bybit,
+                symbol=symbol,
                 side=side,
-                order_type="Market",
-                qty=qty,
-                take_profit=tp,
-                stop_loss=sl,
-                position_idx=position_idx
+                position_idx=position_idx,
+                reason="SL отсутствует, а mark price недоступен для безопасного расчёта",
+                order_prefix="no-sl-exit",
             )
-            logger.info(f"[{coin}] Позиция открыта: {resp}")
-            notify(
-                f"[{coin}] 🟢 {sig.upper()}: {side}\n"
-                f"💰 Размер: {qty} @ ${last_price:.2f}\n"
-                f"📊 Сумма: ${position_size_usd:.2f} (маржа: ${margin_required:.2f})\n"
-                f"⚡ Плечо: {leverage}x\n"
-                f"🎯 TP: ${tp} (+${potential_profit_usd:.2f})\n"
-                f"🛑 SL: ${sl} (-${potential_loss_usd:.2f})\n"
-                f"📈 R/R: {risk_reward_ratio:.2f} | Уверенность: {confidence:.0%}"
+        return None
+    liquidation_safe, liquidation_reason = validate_sl_vs_liquidation(
+        side,
+        float(current_stop),
+        float(liquidation),
+    )
+    target_crossed = (
+        side == "Buy" and current_target > 0 and mark >= current_target
+    ) or (
+        side == "Sell" and current_target > 0 and mark <= current_target
+    )
+    stop_crossed = (
+        side == "Buy" and current_stop > 0 and mark <= current_stop
+    ) or (
+        side == "Sell" and current_stop > 0 and mark >= current_stop
+    )
+    unsafe_existing_stop = current_stop > 0 and not liquidation_safe
+    if target_crossed or stop_crossed or unsafe_existing_stop:
+        crossed = (
+            "TP"
+            if target_crossed
+            else "SL"
+            if stop_crossed
+            else "SL у ликвидации"
+        )
+        anomaly = (
+            f"mark пересёк {crossed}, но позиция осталась открыта"
+            if target_crossed or stop_crossed
+            else "защитный SL слишком близко к ликвидации"
+        )
+        outcome = _close_for_safety(
+            bybit,
+            symbol=symbol,
+            side=side,
+            position_idx=position_idx,
+            reason=anomaly,
+            order_prefix="guard-exit",
+        )
+        if liquidation_reason and unsafe_existing_stop:
+            logger.warning(f"{symbol}: {liquidation_reason}")
+        return outcome
+
+    if not analysis.get("complete"):
+        if mandatory_stop_repair:
+            return _close_for_safety(
+                bybit,
+                symbol=symbol,
+                side=side,
+                position_idx=position_idx,
+                reason="SL отсутствует, а market analysis неполон",
+                order_prefix="no-sl-exit",
             )
-            return {"risk_usd": actual_risk_usd, "margin_with_buffer": margin_with_buffer}
-        except BybitAPIError as e:
-            # Специальная обработка ошибки недостатка средств
-            if e.code == 110007:
-                logger.error(
-                    f"[{coin}] Недостаточно средств! "
-                    f"Требуется маржа: ${margin_required:.2f}, "
-                    f"доступно: ${available_balance:.2f}"
-                )
-                notify(
-                    f"[{coin}] ❌ Недостаточно средств\n"
-                    f"Требуется: ${margin_required:.2f}\n"
-                    f"Доступно: ${available_balance:.2f}"
-                )
-            else:
-                raise  # Пробрасываем другие ошибки выше
+        return None
+    frame = analysis["timeframe_5m"]
+    atr = D(frame["atr14"])
+    if entry <= 0 or atr <= 0:
+        if mandatory_stop_repair:
+            return _close_for_safety(
+                bybit,
+                symbol=symbol,
+                side=side,
+                position_idx=position_idx,
+                reason="SL отсутствует, а entry/ATR непригодны для безопасного расчёта",
+                order_prefix="no-sl-exit",
+            )
+        return None
 
-def main_loop():
-    """Основной цикл бота"""
-    logger.info("="*60)
-    logger.info("🚀 Запуск торгового бота")
-    logger.info(f"DRY_RUN режим: {DRY_RUN}")
-    logger.info(f"Токены: {', '.join(TRADABLE_TOKENS)}")
-    logger.info(f"Интервал опроса: {POLL_INTERVAL}с")
-    logger.info("="*60)
+    if side == "Buy":
+        structural = D(frame["swing_low"]) - atr * D("0.10")
+        candidate_stop = min(structural, mark - atr * D("1.20"))
+        effective_stop = max(current_stop, candidate_stop) if current_stop > 0 else candidate_stop
+        target_needs_repair = current_target <= 0
+        effective_target = (
+            current_target
+            if current_target > mark
+            else mark + max(mark - effective_stop, atr) * 2
+        )
+    elif side == "Sell":
+        structural = D(frame["swing_high"]) + atr * D("0.10")
+        candidate_stop = max(structural, mark + atr * D("1.20"))
+        effective_stop = min(current_stop, candidate_stop) if current_stop > 0 else candidate_stop
+        target_needs_repair = current_target <= 0
+        effective_target = (
+            current_target
+            if 0 < current_target < mark
+            else mark - max(effective_stop - mark, atr) * 2
+        )
+    else:
+        return None
+    if effective_target <= 0:
+        if mandatory_stop_repair:
+            return _close_for_safety(
+                bybit,
+                symbol=symbol,
+                side=side,
+                position_idx=position_idx,
+                reason="SL отсутствует, а корректный TP рассчитать невозможно",
+                order_prefix="no-sl-exit",
+            )
+        return None
 
-    notify(f"🤖 Бот запущен (DRY_RUN: {DRY_RUN})")
+    try:
+        take_profit, stop_loss = bybit.prepare_protective_prices(
+            symbol,
+            side,
+            effective_target,
+            effective_stop,
+        )
+    except Exception:
+        if mandatory_stop_repair:
+            return _close_for_safety(
+                bybit,
+                symbol=symbol,
+                side=side,
+                position_idx=position_idx,
+                reason="SL отсутствует, а защитные цены не прошли правила Bybit",
+                order_prefix="no-sl-exit",
+            )
+        raise
+    if side == "Buy" and not 0 < stop_loss < mark < take_profit:
+        if mandatory_stop_repair:
+            return _close_for_safety(
+                bybit,
+                symbol=symbol,
+                side=side,
+                position_idx=position_idx,
+                reason="SL отсутствует, а рассчитанные LONG TP/SL некорректны",
+                order_prefix="no-sl-exit",
+            )
+        return None
+    if side == "Sell" and not 0 < take_profit < mark < stop_loss:
+        if mandatory_stop_repair:
+            return _close_for_safety(
+                bybit,
+                symbol=symbol,
+                side=side,
+                position_idx=position_idx,
+                reason="SL отсутствует, а рассчитанные SHORT TP/SL некорректны",
+                order_prefix="no-sl-exit",
+            )
+        return None
+    safe, reason = validate_sl_vs_liquidation(
+        side,
+        float(stop_loss),
+        float(D(position.get("liqPrice") or 0)),
+    )
+    if not safe:
+        logger.warning(f"{symbol}: защитный stop не обновлён: {reason}")
+        if mandatory_stop_repair:
+            return _close_for_safety(
+                bybit,
+                symbol=symbol,
+                side=side,
+                position_idx=position_idx,
+                reason=f"SL отсутствует, а рассчитанный stop небезопасен: {reason}",
+                order_prefix="no-sl-exit",
+            )
+        return None
+    if current_stop > 0:
+        change_percent = abs(stop_loss - current_stop) / current_stop * 100
+        if (
+            change_percent < D(TP_SL_MIN_CHANGE_PERCENT)
+            and not target_needs_repair
+        ):
+            return None
 
-    # Инициализация API
-    bybit = BybitAPI()
-    ds = DeepSeekAPI()
+    try:
+        result = bybit.set_trading_stop_and_verify(
+            symbol,
+            position_idx,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )
+    except Exception as error:
+        if not mandatory_stop_repair:
+            raise
+        logger.error(f"{symbol}: обязательная установка SL не подтверждена: {error}")
+        return _close_for_safety(
+            bybit,
+            symbol=symbol,
+            side=side,
+            position_idx=position_idx,
+            reason="обязательная установка отсутствующего SL не подтверждена",
+            order_prefix="no-sl-exit",
+        )
+    preview = bool(result.get("simulated"))
+    notify(
+        f"[{symbol}] {'🧪 Защита рассчитана' if preview else '🛡 Защита подтверждена'}\n"
+        f"TP: {take_profit} · SL: {stop_loss}"
+    )
+    return "protected"
 
-    # Генерируем промпт для DeepSeek на основе текущей конфигурации
-    prompt = build_deepseek_prompt()
-    prompt_summary = get_prompt_summary()
-    logger.info(f"📝 Промпт сгенерирован для {prompt_summary['tokens_count']} токенов: {', '.join(prompt_summary['tokens'])}")
-    logger.info(f"⚙️ Параметры: Leverage {prompt_summary['max_leverage']}x, Risk {prompt_summary['risk_per_trade']}, Min ${prompt_summary['min_order_size']}")
-    logger.debug(f"📊 Таймфреймы: {', '.join(prompt_summary['timeframes'])}")
 
-    iteration = 0
-
-    # Функция для проверки нужно ли продолжать работу
-    def should_continue():
-        """Проверка флага остановки из Telegram бота"""
-        try:
-            from telegram_bot.handlers.auto_mode import AUTO_MODE_STATE
-            # A CLI launch has no registered worker thread and must not inherit
-            # the Telegram UI's initial ``False`` flag.
-            return AUTO_MODE_STATE.get("task") is None or AUTO_MODE_STATE.get("is_running", False)
-        except ImportError:
-            return True
-
-    def wait_until_next_cycle() -> bool:
-        """Sleep in short intervals so the Telegram Stop button reacts promptly."""
-        for _ in range(max(1, POLL_INTERVAL)):
-            if not should_continue():
-                return False
-            time.sleep(1)
-        return True
-
-    while should_continue():
-        iteration += 1
-        logger.info(f"\n{'='*60}")
-        logger.info(f"📊 Итерация #{iteration}")
-        logger.info(f"{'='*60}")
-
-        try:
-            # 1. Получаем позиции
-            logger.info("Получаю позиции...")
-            pos_resp = bybit.get_positions()
-            result = pos_resp.get("result", {})
-
-            positions_list = []
-            if isinstance(result, dict) and "list" in result:
-                positions_list = result["list"]
-            elif isinstance(result, list):
-                positions_list = result
-
-            # Фильтруем только открытые позиции
-            open_positions = [p for p in positions_list if float(p.get("size", 0)) > 0]
-            logger.info(f"Открытых позиций: {len(open_positions)}")
-
-            # 2. Получаем цены
-            logger.info("Получаю цены...")
-            tickers_map = {}
-            for token in TRADABLE_TOKENS:
-                pair = symbol_to_pair(token)
-                try:
-                    t = bybit.get_tickers(pair)
-                    last = t["result"]["list"][0]["lastPrice"]
-                    tickers_map[pair] = {"lastPrice": float(last), "raw": t}
-                    logger.debug(f"{pair}: ${float(last):.2f}")
-                except Exception as e:
-                    logger.error(f"Ошибка получения тикера {pair}: {e}")
-                    tickers_map[pair] = {"lastPrice": None, "raw": None}
-
-            if not tickers_map or all(v["lastPrice"] is None for v in tickers_map.values()):
-                logger.warning("⚠️ Нет данных по ценам — пропускаем итерацию")
-                if not wait_until_next_cycle():
-                    break
-                continue
-
-            # 3. Получаем баланс
-            logger.info("Получаю баланс...")
-            try:
-                balance_resp = bybit.get_wallet_balance()
-                logger.debug(f"Balance response: {balance_resp}")
-
-                account_info = parse_account_overview(balance_resp, max_leverage=MAX_LEVERAGE)
-                logger.info(
-                    f"💰 Баланс: ${account_info['balance_usd']:.2f}, "
-                    f"Equity: ${account_info['equity_usd']:.2f}, "
-                    f"В позициях: ${account_info['position_margin_usd']:.2f}, "
-                    f"В ордерах: ${account_info['order_margin_usd']:.2f}, "
-                    f"Доступно: ${account_info['available_usd']:.2f}"
-                )
-            except Exception as e:
-                logger.error(f"Ошибка получения баланса: {e}")
-                logger.debug(traceback.format_exc())
-                account_info = {
-                    "balance_usd": 0,
-                    "available_usd": 0,
-                    "max_leverage": MAX_LEVERAGE
-                }
-
-            # 4. Формируем контекст
-            context = build_context(positions_list, tickers_map, account_info)
-
-            # 5. Обогащаем контекст техническими индикаторами (3м, 5м, 1ч, 4ч)
-            logger.info("📈 Получаю технические индикаторы (3м, 5м, 1ч, 4ч)...")
-            try:
-                context = enrich_context_with_market_data(bybit, context, TRADABLE_TOKENS)
-                logger.info(f"✅ Индикаторы получены для {len(context.get('market_analysis', {}))} токенов")
-            except Exception as e:
-                logger.warning(f"⚠️ Ошибка получения индикаторов: {e}")
-                # Продолжаем без индикаторов
-
-            # 6. Отправляем в DeepSeek
-            logger.info("🧠 Отправляю контекст в DeepSeek...")
-            try:
-                raw = ds.analyze(prompt, context, temperature=0.0)
-                logger.info(f"✅ Получен ответ от DeepSeek ({len(raw)} символов)")
-                logger.debug(f"Ответ DeepSeek (полный):\n{raw}")
-            except Exception as e:
-                error_str = str(e)
-                logger.error(f"❌ Ошибка DeepSeek API: {e}")
-
-                # Специальная обработка ошибки недостатка баланса
-                if "402" in error_str or "Insufficient Balance" in error_str:
-                    logger.error("💳 У вас недостаточно средств на балансе DeepSeek!")
-                    logger.error("   Пополните баланс: https://platform.deepseek.com/")
-                    logger.error("   DeepSeek Reasoner стоит ~$0.50-1.00 за 1M токенов")
-                    notify("💳 Ошибка: недостаточно средств на DeepSeek. Пополните баланс на platform.deepseek.com")
-                else:
-                    notify(f"❌ Ошибка DeepSeek: {e}")
-
-                if not wait_until_next_cycle():
-                    break
-                continue
-
-            # 7. Валидация JSON
-            try:
-                decision = validate_deepseek_json(raw, expected_tokens=TRADABLE_TOKENS)
-                logger.info(f"✅ Получены решения для {len(decision)} токенов")
-            except Exception as e:
-                logger.error(f"❌ Невалидный JSON от DeepSeek: {e}")
-                logger.debug(f"Raw response: {raw}")
-                notify(f"❌ Невалидный JSON от DeepSeek")
-                if not wait_until_next_cycle():
-                    break
-                continue
-
-            # 8. Исполнение решений
-            logger.info("⚙️ Исполняю решения...")
-            execute_decision(bybit, decision, account_info)
-
-            logger.info(f"✅ Итерация #{iteration} завершена")
-
-        except KeyboardInterrupt:
-            logger.info("⛔ Получен сигнал остановки")
-            notify("⛔ Бот остановлен вручную")
+def manage_existing_protection(
+    bybit: BybitAPI,
+    cycle: dict[str, Any],
+    stop_event: threading.Event,
+) -> list[str]:
+    """Run code-owned position safety independently of any AI response."""
+    actions: list[str] = []
+    for position in cycle["positions"]:
+        if stop_event.is_set():
             break
-        except Exception as e:
-            logger.error(f"❌ Ошибка в главном цикле: {e}")
-            logger.debug(traceback.format_exc())
-            notify(f"❌ Критическая ошибка: {e}")
+        symbol = str(position.get("symbol", ""))
+        token = symbol.removesuffix("USDT")
+        analysis = cycle["analyses"].get(token, {})
+        with EXECUTION_LOCK:
+            if stop_event.is_set():
+                break
+            outcome = _manage_protection(bybit, position, analysis)
+        if outcome:
+            actions.append(f"{outcome}:{symbol}")
+    return actions
 
-        # Проверка флага остановки перед сном
-        if not should_continue():
-            logger.info("⏹️ Авто-режим остановлен через Telegram бот")
-            notify("⏹️ Авто-режим остановлен")
-            break
 
-        logger.info(f"💤 Сплю {POLL_INTERVAL}с...\n")
+def _urgent_protection_preflight(
+    bybit: BybitAPI,
+    stop_event: threading.Event,
+) -> list[str]:
+    """Handle crossed, unsafe, or missing stops before any expensive analysis."""
+    response = bybit.get_positions()
+    result = response.get("result")
+    rows = result.get("list") if isinstance(result, dict) else None
+    if not isinstance(rows, list):
+        raise FatalExecutionError("Bybit вернул повреждённый список позиций")
+    try:
+        positions = [item for item in rows if D(item.get("size", 0)) > 0]
+    except (AttributeError, TypeError, ValueError, BybitAPIError) as error:
+        raise FatalExecutionError(
+            "Невозможно проверить срочное защитное состояние позиций"
+        ) from error
+    return manage_existing_protection(
+        bybit,
+        {"positions": positions, "analyses": {}},
+        stop_event,
+    )
 
-        if not wait_until_next_cycle():
-            logger.info("⏹️ Авто-режим остановлен через Telegram бот")
-            notify("⏹️ Авто-режим остановлен")
+
+def _emergency_flatten_entry(
+    bybit: BybitAPI,
+    *,
+    symbol: str,
+    side: str,
+    position_idx: int,
+    reason: str,
+    require_position: bool,
+) -> bool:
+    """Confirm a newly created position is flat or stop on any uncertainty."""
+    position: Optional[dict[str, Any]] = None
+    if require_position:
+        try:
+            position = bybit.wait_for_position(
+                symbol,
+                position_idx,
+                lambda item: D(item.get("size", 0)) > 0,
+            )
+        except Exception as error:
+            raise FatalExecutionError(
+                f"{symbol}: Bybit сообщил об исполнении, но позиция не подтверждена"
+            ) from error
+    else:
+        try:
+            position = _open_position(bybit, symbol, position_idx)
+        except Exception as error:
+            raise FatalExecutionError(
+                f"{symbol}: невозможно проверить позицию после неопределённого ордера"
+            ) from error
+    if not position:
+        return False
+    logger.critical(f"{symbol}: {reason}; выполняю подтверждённое аварийное закрытие")
+    _confirmed_safety_flatten(
+        bybit,
+        symbol=symbol,
+        side=side,
+        position_idx=position_idx,
+        reason=reason,
+        order_prefix="entry-exit",
+    )
+    return True
+
+
+def _terminal_order_executed(order: dict[str, Any]) -> bool:
+    """Interpret terminal execution evidence without treating unknown as zero."""
+    if not isinstance(order, dict):
+        raise FatalExecutionError(
+            "Bybit вернул повреждённый итог entry-ордера"
+        )
+    status = order.get("orderStatus")
+    if not isinstance(status, str) or status not in TERMINAL_ORDER_STATUSES:
+        raise FatalExecutionError(
+            f"Bybit вернул неизвестный итог entry-ордера: {status!r}"
+        )
+    raw_executed = order.get("cumExecQty")
+    if (
+        raw_executed is None
+        or raw_executed == ""
+        or isinstance(raw_executed, bool)
+    ):
+        raise FatalExecutionError(
+            "Bybit не вернул подтверждённый cumExecQty entry-ордера"
+        )
+    try:
+        executed = D(raw_executed)
+    except ValueError as error:
+        raise FatalExecutionError(
+            "Bybit вернул некорректный cumExecQty entry-ордера"
+        ) from error
+    if executed < 0:
+        raise FatalExecutionError(
+            "Bybit вернул отрицательный cumExecQty entry-ордера"
+        )
+    return (
+        status == "Filled"
+        or status in PARTIAL_TERMINAL_ORDER_STATUSES
+        or executed > 0
+    )
+
+
+def _execute_candidate(
+    bybit: BybitAPI,
+    candidate: dict[str, Any],
+    cycle: dict[str, Any],
+    fee_rates: dict[str, Decimal],
+    stop_event: threading.Event,
+) -> TradePlan:
+    symbol = str(candidate["symbol"])
+    try:
+        valid_until = datetime.fromisoformat(
+            str(cycle["snapshot"]["valid_until"]).replace("Z", "+00:00")
+        )
+    except (KeyError, ValueError) as error:
+        raise ValueError("Snapshot не содержит корректный valid_until") from error
+    if datetime.now(timezone.utc) >= valid_until:
+        raise ValueError("Snapshot устарел до начала исполнения")
+
+    fresh = _fresh_entry_state(bybit, fee_rates)
+    if fresh["entry_block_reason"]:
+        raise ValueError(
+            f"Свежий entry gate заблокировал вход: {fresh['entry_block_reason']}"
+        )
+    ticker_response = bybit.get_tickers(symbol)
+    ticker = ticker_response.get("result", {}).get("list", [None])[0]
+    if not ticker:
+        raise BybitAPIError(f"Не удалось перепроверить ticker {symbol}")
+    rules = bybit.get_instrument_rules(symbol, refresh=True)
+
+    def build_current_plan(state: dict[str, Any]) -> TradePlan:
+        available_usd = D(state["account"]["available_usd"])
+        portfolio_risk = D(state["portfolio_risk"])
+        if DRY_RUN:
+            # DRY writes do not change Bybit state.  Preserve reservations
+            # from earlier previews in this cycle.
+            cycle_account = cycle.get("account") or {}
+            available_usd = min(
+                available_usd,
+                D(cycle_account.get("available_usd", available_usd)),
+            )
+            portfolio_risk = max(
+                portfolio_risk,
+                D(cycle.get("portfolio_risk", portfolio_risk)),
+            )
+        return build_trade_plan(
+            candidate,
+            rules=rules,
+            ticker=ticker,
+            equity_usd=state["account"]["equity_usd"],
+            available_usd=available_usd,
+            current_portfolio_risk_usd=portfolio_risk,
+            taker_fee_rate=fee_rates.get(
+                symbol,
+                D(FALLBACK_TAKER_FEE_RATE),
+            ),
+        )
+
+    preliminary_plan = build_current_plan(fresh)
+    if any(
+        position.get("symbol") == symbol
+        for position in fresh["positions"]
+    ):
+        raise ValueError(f"{symbol}: позиция уже существует; разворот запрещён")
+    rows = bybit.get_positions(symbol=symbol).get("result", {}).get("list", [])
+    if any(D(position.get("size", 0)) > 0 for position in rows):
+        raise ValueError(f"{symbol}: позиция появилась перед отправкой ордера")
+    position_idx = 0
+    if rows and any(int(position.get("positionIdx", 0)) > 0 for position in rows):
+        position_idx = 1 if preliminary_plan.side == "Buy" else 2
+
+    if datetime.now(timezone.utc) >= valid_until:
+        raise ValueError("Snapshot устарел до изменения leverage")
+    if stop_event.is_set():
+        raise ExecutionStopped("Авто-режим остановлен до изменения leverage")
+    try:
+        bybit.set_leverage(
+            symbol,
+            preliminary_plan.leverage,
+            preliminary_plan.leverage,
+        )
+    except BybitAPIError as error:
+        if error.code != 110043:
+            raise
+    if datetime.now(timezone.utc) >= valid_until:
+        raise ValueError("Snapshot устарел непосредственно перед отправкой ордера")
+    if stop_event.is_set():
+        raise ExecutionStopped("Авто-режим остановлен до отправки entry-ордера")
+
+    # These account-wide reads happen after the leverage mutation and remain
+    # adjacent to create-order.  The plan is recalculated from their values.
+    final_state = _final_entry_state(bybit, fee_rates)
+    if final_state["entry_block_reason"]:
+        raise ValueError(
+            "Финальная проверка экспозиции заблокировала вход: "
+            f"{final_state['entry_block_reason']}"
+        )
+    if any(
+        position.get("symbol") == symbol
+        for position in final_state["positions"]
+    ):
+        raise ValueError(f"{symbol}: позиция появилась перед отправкой ордера")
+    plan = build_current_plan(final_state)
+    if plan.leverage != preliminary_plan.leverage:
+        raise ValueError(
+            f"{symbol}: требуемое leverage изменилось при финальной "
+            "проверке; вход отменён"
+        )
+
+    slippage = D(BYBIT_MAX_SLIPPAGE_PERCENT) / 100
+    if plan.side == "Buy":
+        entry_limit = rules.price(
+            plan.entry_price * (Decimal("1") + slippage),
+            ROUND_DOWN,
+        )
+        if not plan.stop_loss < entry_limit < plan.take_profit:
+            raise ValueError(f"{symbol}: price cap конфликтует с TP/SL")
+    else:
+        entry_limit = rules.price(
+            plan.entry_price * (Decimal("1") - slippage),
+            ROUND_UP,
+        )
+        if not plan.take_profit < entry_limit < plan.stop_loss:
+            raise ValueError(f"{symbol}: price floor конфликтует с TP/SL")
+
+    if datetime.now(timezone.utc) >= valid_until:
+        raise ValueError("Snapshot устарел непосредственно перед отправкой ордера")
+    if stop_event.is_set():
+        raise ExecutionStopped("Авто-режим остановлен до отправки entry-ордера")
+    try:
+        result = bybit.place_order_and_confirm(
+            symbol=symbol,
+            side=plan.side,
+            # Aggressive IOC limit behaves like a marketable order while
+            # bounding the fill price and still allowing attached Full TP/SL.
+            order_type="Limit",
+            qty=plan.quantity,
+            price=entry_limit,
+            time_in_force="IOC",
+            take_profit=plan.take_profit,
+            stop_loss=plan.stop_loss,
+            position_idx=position_idx,
+            order_link_id=f"open-{plan.candidate_id}"[:36],
+        )
+    except BybitOrderNotFilledError as error:
+        try:
+            executed = _terminal_order_executed(error.order)
+        except FatalExecutionError:
+            _emergency_flatten_entry(
+                bybit,
+                symbol=symbol,
+                side=plan.side,
+                position_idx=position_idx,
+                reason="неизвестный итог исполнения входа",
+                require_position=False,
+            )
+            raise
+        if executed:
+            _emergency_flatten_entry(
+                bybit,
+                symbol=symbol,
+                side=plan.side,
+                position_idx=position_idx,
+                reason="частичное исполнение входа",
+                require_position=True,
+            )
+        raise
+    except BybitOrderConfirmationError as error:
+        try:
+            final = bybit.cancel_order_and_confirm(
+                symbol=symbol,
+                order_link_id=error.order_link_id,
+            )
+        except Exception as cancel_error:
+            # Flatten anything already visible, but remain fail-stopped because
+            # the still-unknown order could fill later.
+            _emergency_flatten_entry(
+                bybit,
+                symbol=symbol,
+                side=plan.side,
+                position_idx=position_idx,
+                reason="неопределённый вход",
+                require_position=False,
+            )
+            raise FatalExecutionError(
+                f"{symbol}: итог входа и его отмены не подтверждены"
+            ) from cancel_error
+        try:
+            executed = _terminal_order_executed(final)
+        except FatalExecutionError:
+            _emergency_flatten_entry(
+                bybit,
+                symbol=symbol,
+                side=plan.side,
+                position_idx=position_idx,
+                reason="неизвестный итог отменённого входа",
+                require_position=False,
+            )
+            raise
+        _emergency_flatten_entry(
+            bybit,
+            symbol=symbol,
+            side=plan.side,
+            position_idx=position_idx,
+            reason="вход после неопределённого подтверждения",
+            require_position=executed,
+        )
+        raise
+    if result.get("simulated"):
+        notify(
+            f"[{symbol}] 🧪 PREVIEW {plan.side}\n"
+            f"qty {plan.quantity} · entry ≈ {plan.entry_price} · cap {entry_limit}\n"
+            f"TP {plan.take_profit} · SL {plan.stop_loss}\n"
+            f"risk ${plan.risk_usd:.2f} · net R/R {plan.net_risk_reward:.2f}"
+        )
+        return plan
+
+    try:
+        position = bybit.wait_for_position(
+            symbol,
+            position_idx,
+            lambda item: D(item.get("size", 0)) > 0,
+        )
+    except Exception as position_error:
+        # A Filled order without a visible position is an inconsistent state.
+        # Stop the worker instead of proceeding to another cycle.
+        raise FatalExecutionError(
+            f"{symbol}: fill подтверждён, но позиция недоступна для защиты"
+        ) from position_error
+    stop_safe, stop_reason = validate_sl_vs_liquidation(
+        plan.side,
+        float(plan.stop_loss),
+        float(D(position.get("liqPrice") or 0)),
+    )
+    if not stop_safe:
+        _emergency_flatten_entry(
+            bybit,
+            symbol=symbol,
+            side=plan.side,
+            position_idx=position_idx,
+            reason=f"расчётный SL небезопасен: {stop_reason}",
+            require_position=False,
+        )
+        raise BybitAPIError(f"{symbol}: расчётный SL небезопасен: {stop_reason}")
+    protected = (
+        D(position.get("takeProfit") or 0) == plan.take_profit
+        and D(position.get("stopLoss") or 0) == plan.stop_loss
+    )
+    if not protected:
+        try:
+            position = bybit.set_trading_stop_and_verify(
+                symbol,
+                position_idx,
+                take_profit=plan.take_profit,
+                stop_loss=plan.stop_loss,
+            )
+            protected = not position.get("simulated")
+        except Exception as protection_error:
+            # A filled but unprotected position is more dangerous than a
+            # missed setup.  Attempt a confirmed reduce-only exit.
+            logger.critical(f"{symbol}: protection failed; emergency close")
+            _confirmed_safety_flatten(
+                bybit,
+                symbol=symbol,
+                side=plan.side,
+                position_idx=position_idx,
+                reason="защита новой позиции не подтвердилась",
+                order_prefix="protection-exit",
+            )
+            raise protection_error
+    if not protected:
+        raise BybitAPIError(f"{symbol}: защита позиции не подтверждена")
+    notify(
+        f"[{symbol}] ✅ {plan.side} исполнен и защищён\n"
+        f"qty {plan.quantity} · fill {result.get('avgPrice') or plan.entry_price}\n"
+        f"TP {plan.take_profit} · SL {plan.stop_loss}\n"
+        f"risk ${plan.risk_usd:.2f} · net R/R {plan.net_risk_reward:.2f}"
+    )
+    return plan
+
+
+def execute_decisions(
+    bybit: BybitAPI,
+    decision: dict[str, Any],
+    cycle: dict[str, Any],
+    fee_rates: dict[str, Decimal],
+    stop_event: threading.Event,
+) -> list[str]:
+    """Serialize code-approved candidate entries and reserve each signal once."""
+    actions: list[str] = []
+    decisions = decision["decisions"]
+
+    if cycle["entry_block_reason"]:
+        logger.warning(f"Новые входы заблокированы: {cycle['entry_block_reason']}")
+        return actions
+
+    for item in decisions:
+        if item["action"] != "select_candidate" or stop_event.is_set():
+            continue
+        candidate = selected_candidate(item, cycle["snapshot"])
+        if not candidate:
+            continue
+        store = get_store()
+        if not store.reserve_execution_signal(candidate["id"], candidate["symbol"]):
+            logger.info(f"{candidate['symbol']}: кандидат уже обрабатывался")
+            continue
+        try:
+            with EXECUTION_LOCK:
+                if stop_event.is_set():
+                    store.update_execution_signal(candidate["id"], "stopped")
+                    return actions
+                plan = _execute_candidate(
+                    bybit,
+                    candidate,
+                    cycle,
+                    fee_rates,
+                    stop_event,
+                )
+            store.update_execution_signal(
+                candidate["id"],
+                "previewed" if DRY_RUN else "filled",
+            )
+            actions.append(f"{'preview' if DRY_RUN else 'opened'}:{plan.symbol}")
+            cycle["portfolio_risk"] += plan.risk_usd
+            cycle["account"]["available_usd"] = max(
+                0.0,
+                float(D(cycle["account"]["available_usd"]) - plan.margin_with_buffer),
+            )
+        except ExecutionStopped:
+            store.update_execution_signal(candidate["id"], "stopped")
+            return actions
+        except Exception:
+            store.update_execution_signal(candidate["id"], "failed")
+            raise
+    return actions
+
+
+def _wait(stop_event: threading.Event, seconds: int) -> bool:
+    return stop_event.wait(max(1, seconds))
+
+
+def main_loop(
+    stop_event: Optional[threading.Event] = None,
+    *,
+    once: bool = False,
+) -> None:
+    """Run until stopped; check the stop event before every exchange mutation."""
+    event = stop_event or threading.Event()
+    errors = validate_config("auto")
+    if errors:
+        message = "Некорректная конфигурация: " + "; ".join(errors)
+        _set_runtime(
+            state="stopped",
+            last_error=message[:300],
+            last_summary="Авто-режим заблокирован конфигурацией",
+        )
+        raise ValueError(message)
+    _set_runtime(state="starting", last_error=None)
+    bybit: Optional[BybitAPI] = None
+    deepseek: Optional[DeepSeekAPI] = None
+    fatal_error: Optional[FatalExecutionError] = None
+    try:
+        bybit = BybitAPI()
+        _set_runtime(state="running")
+        notify(f"🤖 Авто-режим запущен · {'DRY preview' if DRY_RUN else 'LIVE'}")
+        pending_preflight = _urgent_protection_preflight(bybit, event)
+        if any(item.startswith("closed:") for item in pending_preflight):
+            summary = "Срочные защитные действия: " + ", ".join(
+                pending_preflight
+            )
+            _set_runtime(last_summary=summary)
+            logger.warning(summary)
+            if once or _wait(event, POLL_INTERVAL):
+                return
+            pending_preflight = None
+        if event.is_set():
             return
+        deepseek = DeepSeekAPI()
+        deepseek.validate_model()
+        fees = _fee_rates(bybit)
+        fees_refreshed_at = time.monotonic()
+        # Model validation and fee reads may take time; never reuse the
+        # startup safety snapshot for the first trading cycle.
+        pending_preflight = None
+        iteration = 0
+        while not event.is_set():
+            iteration += 1
+            _set_runtime(
+                iteration=iteration,
+                last_cycle_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                last_error=None,
+            )
+            try:
+                urgent_actions = pending_preflight
+                pending_preflight = None
+                if urgent_actions is None:
+                    urgent_actions = _urgent_protection_preflight(bybit, event)
+                if any(item.startswith("closed:") for item in urgent_actions):
+                    summary = "Срочные защитные действия: " + ", ".join(
+                        urgent_actions
+                    )
+                    _set_runtime(last_summary=summary)
+                    logger.warning(summary)
+                    if once or _wait(event, POLL_INTERVAL):
+                        break
+                    continue
+                if time.monotonic() - fees_refreshed_at >= FEE_REFRESH_SECONDS:
+                    fees = _fee_rates(bybit, previous=fees)
+                    fees_refreshed_at = time.monotonic()
+                if event.is_set():
+                    break
+                cycle = collect_cycle(bybit, fees)
+                safety_actions = urgent_actions + manage_existing_protection(
+                    bybit,
+                    cycle,
+                    event,
+                )
+                if any(item.startswith("closed:") for item in safety_actions):
+                    summary = "Защитные действия: " + ", ".join(safety_actions)
+                    _set_runtime(last_summary=summary)
+                    logger.warning(summary)
+                    if once or _wait(event, POLL_INTERVAL):
+                        break
+                    continue
+                snapshot = cycle["snapshot"]
+                candidate_count = sum(
+                    len(item.get("candidates", []))
+                    for item in snapshot["symbols"].values()
+                )
+                _set_runtime(
+                    last_snapshot_id=snapshot["snapshot_id"],
+                    last_summary=(
+                        f"Кандидатов: {candidate_count}"
+                        + (
+                            f" · входы заблокированы: {cycle['entry_block_reason']}"
+                            if cycle["entry_block_reason"]
+                            else ""
+                        )
+                    ),
+                )
+                if not candidate_count:
+                    logger.info("Нет детерминированных кандидатов; AI-вызов не нужен")
+                else:
+                    raw = deepseek.analyze(build_selector_prompt(), snapshot)
+                    decision = validate_trade_decision(raw, snapshot)
+                    if event.is_set():
+                        logger.info("Stop получен после AI; торговые действия отменены")
+                        break
+                    actions = safety_actions + execute_decisions(
+                        bybit,
+                        decision,
+                        cycle,
+                        fees,
+                        event,
+                    )
+                    summary = "Действия: " + (", ".join(actions) if actions else "нет")
+                    _set_runtime(last_summary=summary)
+                    logger.info(summary)
+            except Exception as error:
+                _set_runtime(last_error=str(error)[:300], last_summary="Цикл завершён с ошибкой")
+                logger.error(f"Ошибка авто-цикла: {error}")
+                logger.debug(traceback.format_exc())
+                if isinstance(error, FatalExecutionError):
+                    fatal_error = error
+                    event.set()
+                try:
+                    notify(f"⚠️ Авто-цикл остановлен до следующей проверки: {error}")
+                    if isinstance(error, FatalExecutionError):
+                        notify(
+                            "🛑 Авто-режим аварийно остановлен: "
+                            "возможна незащищённая позиция"
+                        )
+                except Exception as notify_error:
+                    logger.warning(
+                        f"Не удалось отправить уведомление об ошибке auto: {notify_error}"
+                    )
+            if once or _wait(event, POLL_INTERVAL):
+                break
+    except Exception as error:
+        _set_runtime(
+            last_error=str(error)[:300],
+            last_summary="Авто-режим не запущен",
+        )
+        logger.error(f"Ошибка запуска авто-режима: {error}")
+        raise
+    finally:
+        _set_runtime(state="stopped")
+        if deepseek is not None:
+            try:
+                deepseek.close()
+            except Exception as error:
+                logger.warning(f"Не удалось закрыть DeepSeek session: {error}")
+        if bybit is not None:
+            try:
+                bybit.close()
+            except Exception as error:
+                logger.warning(f"Не удалось закрыть Bybit session: {error}")
+        try:
+            notify("⏹ Авто-режим остановлен")
+        except Exception as error:
+            logger.warning(f"Не удалось отправить stop notification: {error}")
+    if fatal_error is not None:
+        raise fatal_error
+
 
 if __name__ == "__main__":
     try:
         main_loop()
-    except Exception as e:
-        logger.critical(f"💥 Критическая ошибка при запуске: {e}")
-        logger.debug(traceback.format_exc())
-        notify(f"💥 Критическая ошибка: {e}")
+    except KeyboardInterrupt:
+        logger.info("Авто-режим остановлен пользователем")

@@ -42,9 +42,7 @@ def run_telegram_bot():
     logger.info("Запуск Telegram бота...")
 
     if not TELEGRAM_TOKEN:
-        logger.error("❌ TELEGRAM_TOKEN не установлен!")
-        logger.error("Задайте TELEGRAM_TOKEN перед запуском приложения")
-        return
+        raise ValueError("TELEGRAM_TOKEN не установлен")
 
     from telegram_bot.bot import run_telegram_bot as run_bot
     run_bot()
@@ -108,5 +106,7 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         logger.info("\n👋 Программа остановлена пользователем")
+        raise SystemExit(130)
     except Exception as e:
         logger.critical(f"💥 Критическая ошибка: {e}")
+        raise SystemExit(1) from e

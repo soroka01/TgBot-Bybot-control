@@ -1,8 +1,9 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 chcp 65001 >nul 2>&1
 set "PYTHONUTF8=1"
+set "PIP_DISABLE_PIP_VERSION_CHECK=1"
 
 set "PYTHON_CMD=.venv\Scripts\python.exe"
 if not exist "%PYTHON_CMD%" (
@@ -15,26 +16,60 @@ if not exist "%PYTHON_CMD%" (
     )
     if not defined BOOTSTRAP_PY (
         echo [ERROR] Python 3 was not found.
-        exit /b 1
+        goto :failed
+    )
+    !BOOTSTRAP_PY! -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] Python 3.10 or newer is required.
+        goto :failed
     )
     echo [SETUP] Creating local .venv...
-    %BOOTSTRAP_PY% -m venv .venv
+    !BOOTSTRAP_PY! -m venv .venv
     if errorlevel 1 (
         echo [ERROR] Could not create .venv.
-        exit /b 1
+        goto :failed
     )
 )
 
-if exist "requirements.txt" (
+"%PYTHON_CMD%" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] .venv uses Python older than 3.10.
+    echo [ACTION] Recreate .venv with Python 3.10 or newer.
+    goto :failed
+)
+
+if not exist ".env" (
+    if not exist ".env.example" (
+        echo [ERROR] Neither .env nor .env.example was found.
+        goto :failed
+    )
+    copy /y ".env.example" ".env" >nul
+    echo [SETUP] Created .env from .env.example.
+    echo [ACTION] Fill in the keys in .env, then run start.bat again.
+    goto :failed
+)
+
+"%PYTHON_CMD%" -c "import aiogram, dotenv, loguru, numpy, openai, requests" >nul 2>&1
+if errorlevel 1 (
     echo [SETUP] Installing dependencies into .venv...
-    set "PIP_DISABLE_PIP_VERSION_CHECK=1"
     "%PYTHON_CMD%" -m pip install -r requirements.txt
     if errorlevel 1 (
         echo [ERROR] Dependency installation failed.
-        exit /b 1
+        goto :failed
     )
 )
 
+echo [START] Telegram bot
 "%PYTHON_CMD%" main.py telegram %*
 set "EXIT_CODE=%ERRORLEVEL%"
+if not "%EXIT_CODE%"=="0" (
+    echo.
+    echo [ERROR] Bot stopped with exit code %EXIT_CODE%.
+    pause
+)
 endlocal & exit /b %EXIT_CODE%
+
+:failed
+echo.
+pause
+endlocal & exit /b 1

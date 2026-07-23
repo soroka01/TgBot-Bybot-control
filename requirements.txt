@@ -1,11 +1,11 @@
 # HTTP and external APIs
-requests>=2.31.0
-openai>=1.0.0
-tenacity>=8.2.0
+requests>=2.31.0,<3
+openai>=1.60.0,<3
+python-dotenv>=1.0.0,<2
 
 # Market calculations and logs
-numpy>=1.24.0
-loguru>=0.7.0
+numpy>=1.24.0,<3
+loguru>=0.7.0,<1
 
 # Telegram
-aiogram>=3.7.0
+aiogram>=3.7.0,<4

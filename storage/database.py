@@ -8,12 +8,13 @@ does not block the event loop.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from config import ALERT_DEFAULT_COOLDOWN_SECONDS, DATABASE_PATH
 from utils.logger_setup import logger
@@ -113,12 +114,85 @@ class SQLiteStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS execution_signals (
+                    candidate_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS daily_risk_state (
+                    utc_day TEXT PRIMARY KEY,
+                    start_equity REAL NOT NULL,
+                    high_water_equity REAL NOT NULL,
+                    last_equity REAL NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS notification_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    alert_id INTEGER,
+                    message TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'delivered')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    delivered_at TEXT,
+                    next_attempt_at TEXT,
+                    last_attempt_at TEXT,
+                    last_error TEXT,
+                    abandoned_at TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_alerts_active
                     ON alerts(is_enabled, kind, symbol, timeframe);
                 CREATE INDEX IF NOT EXISTS idx_alerts_chat ON alerts(chat_id, is_enabled);
                 CREATE INDEX IF NOT EXISTS idx_activity_chat_time
                     ON activity_log(chat_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_execution_signals_time
+                    ON execution_signals(created_at);
+                CREATE INDEX IF NOT EXISTS idx_daily_risk_time
+                    ON daily_risk_state(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_outbox_pending
+                    ON notification_outbox(status, id);
                 """
+            )
+            # Add retry metadata to databases created by older revisions.
+            outbox_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(notification_outbox)")
+            }
+            for name, declaration in {
+                "next_attempt_at": "TEXT",
+                "last_attempt_at": "TEXT",
+                "last_error": "TEXT",
+                "abandoned_at": "TEXT",
+            }.items():
+                if name not in outbox_columns:
+                    conn.execute(
+                        f"ALTER TABLE notification_outbox "
+                        f"ADD COLUMN {name} {declaration}"
+                    )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_outbox_retry
+                ON notification_outbox(
+                    status, abandoned_at, next_attempt_at, attempts, id
+                )
+                """
+            )
+            # The bot now has a strict private-chat invariant.  Deactivate
+            # legacy group rows so restart cannot edit or notify an old group.
+            conn.execute(
+                """
+                UPDATE users
+                SET is_active = 0, screen_message_id = NULL, updated_at = ?
+                WHERE telegram_user_id IS NOT NULL
+                  AND chat_id <> telegram_user_id
+                """,
+                (_utcnow(),),
             )
 
     def ensure_user(self, user: Any, chat_id: int, is_admin: bool = False) -> None:
@@ -139,7 +213,7 @@ class SQLiteStore:
                     first_name = excluded.first_name,
                     last_name = excluded.last_name,
                     display_name = COALESCE(NULLIF(users.display_name, ''), excluded.display_name),
-                    is_admin = CASE WHEN excluded.is_admin = 1 THEN 1 ELSE users.is_admin END,
+                    is_admin = excluded.is_admin,
                     is_active = 1,
                     updated_at = excluded.updated_at,
                     last_seen_at = excluded.last_seen_at
@@ -186,16 +260,35 @@ class SQLiteStore:
                 (message_id, revision, now, chat_id),
             )
 
-    def screen_targets(self) -> list[tuple[int, int]]:
+    def deactivate_chat(self, chat_id: int) -> None:
+        """Drop a permanently unreachable Telegram target until it writes again."""
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE users
+                SET is_active = 0, screen_message_id = NULL, updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (_utcnow(), chat_id),
+            )
+
+    def screen_targets(self) -> list[tuple[int, int, int]]:
         with self._lock, self._connection() as conn:
             rows = conn.execute(
                 """
-                SELECT chat_id, screen_message_id FROM users
-                WHERE is_active = 1 AND notifications_enabled = 1
-                  AND screen_message_id IS NOT NULL
+                SELECT chat_id, screen_message_id, screen_revision FROM users
+                WHERE is_active = 1 AND screen_message_id IS NOT NULL
+                  AND telegram_user_id = chat_id
                 """
             ).fetchall()
-        return [(int(row["chat_id"]), int(row["screen_message_id"])) for row in rows]
+        return [
+            (
+                int(row["chat_id"]),
+                int(row["screen_message_id"]),
+                int(row["screen_revision"]),
+            )
+            for row in rows
+        ]
 
     def create_alert(
         self,
@@ -215,7 +308,12 @@ class SQLiteStore:
             raise ValueError("Направление алерта должно быть above или below")
         if repeat_mode not in {"once", "repeat"}:
             raise ValueError("Недопустимый режим повтора")
-        if threshold <= 0 or (kind == "rsi" and threshold > 100):
+        threshold = float(threshold)
+        if (
+            not math.isfinite(threshold)
+            or threshold <= 0
+            or (kind == "rsi" and threshold > 100)
+        ):
             raise ValueError("Порог алерта вне допустимого диапазона")
         now = _utcnow()
         with self._lock, self._connection() as conn:
@@ -262,12 +360,18 @@ class SQLiteStore:
                        u.rsi_alerts_enabled
                 FROM alerts a JOIN users u ON u.chat_id = a.chat_id
                 WHERE a.is_enabled = 1 AND u.is_active = 1
+                  AND u.telegram_user_id = u.chat_id
                 """
             ).fetchall()
         return [dict(row) for row in rows]
 
     def apply_alert_observation(
-        self, alert_id: int, *, value: float, should_trigger: bool
+        self,
+        alert_id: int,
+        *,
+        value: float,
+        should_trigger: bool,
+        notification_message: Optional[str] = None,
     ) -> bool:
         """Persist one observation atomically and report a permitted trigger."""
         now = _utcnow()
@@ -299,6 +403,15 @@ class SQLiteStore:
                     1 if triggered else 0, enabled, now, alert_id,
                 ),
             )
+            if triggered and notification_message:
+                conn.execute(
+                    """
+                    INSERT INTO notification_outbox (
+                        chat_id, alert_id, message, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (int(alert["chat_id"]), alert_id, notification_message, now),
+                )
             conn.execute("COMMIT")
             return triggered
 
@@ -338,6 +451,193 @@ class SQLiteStore:
                 (chat_id, max(1, min(limit, 50))),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def reserve_execution_signal(self, candidate_id: str, symbol: str) -> bool:
+        """Atomically reserve one deterministic candle candidate."""
+        now = _utcnow()
+        with self._lock, self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO execution_signals (
+                    candidate_id, symbol, status, created_at, updated_at
+                ) VALUES (?, ?, 'reserved', ?, ?)
+                """,
+                (candidate_id, symbol, now, now),
+            )
+            conn.execute(
+                "DELETE FROM execution_signals WHERE created_at < ?",
+                (
+                    (
+                        datetime.now(timezone.utc) - timedelta(days=14)
+                    ).isoformat(timespec="seconds"),
+                ),
+            )
+            conn.execute("COMMIT")
+            return cursor.rowcount == 1
+
+    def update_execution_signal(self, candidate_id: str, status: str) -> None:
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE execution_signals
+                SET status = ?, updated_at = ?
+                WHERE candidate_id = ?
+                """,
+                (status, _utcnow(), candidate_id),
+            )
+
+    def update_daily_equity_guard(
+        self,
+        equity: float,
+        *,
+        utc_day: Optional[str] = None,
+        scope: str = "default",
+    ) -> dict[str, float | str]:
+        """Persist a UTC-day equity high-water mark across worker restarts."""
+        value = float(equity)
+        if not value > 0:
+            raise ValueError("Equity для дневного guard должен быть положительным")
+        day = utc_day or datetime.now(timezone.utc).date().isoformat()
+        guard_key = f"{scope[:96]}|{day}"
+        now = _utcnow()
+        with self._lock, self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM daily_risk_state WHERE utc_day = ?",
+                (guard_key,),
+            ).fetchone()
+            if row:
+                start = float(row["start_equity"])
+                high = max(float(row["high_water_equity"]), value)
+                conn.execute(
+                    """
+                    UPDATE daily_risk_state
+                    SET high_water_equity = ?, last_equity = ?, updated_at = ?
+                    WHERE utc_day = ?
+                    """,
+                    (high, value, now, guard_key),
+                )
+            else:
+                start = high = value
+                conn.execute(
+                    """
+                    INSERT INTO daily_risk_state (
+                        utc_day, start_equity, high_water_equity, last_equity, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (guard_key, value, value, value, now),
+                )
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=14)
+            ).isoformat(timespec="seconds")
+            conn.execute(
+                "DELETE FROM daily_risk_state WHERE updated_at < ?",
+                (cutoff,),
+            )
+            conn.execute("COMMIT")
+        return {
+            "utc_day": day,
+            "start_equity": start,
+            "high_water_equity": high,
+            "last_equity": value,
+            "drawdown": max(0.0, high - value),
+        }
+
+    def pending_notifications(self, limit: int = 50) -> list[dict[str, Any]]:
+        now = _utcnow()
+        with self._lock, self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, chat_id, alert_id, message, attempts, created_at,
+                       next_attempt_at
+                FROM notification_outbox
+                WHERE status = 'pending' AND abandoned_at IS NULL
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                ORDER BY attempts ASC, id ASC LIMIT ?
+                """,
+                (now, max(1, min(limit, 200))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_notification_attempt(
+        self,
+        outbox_ids: int | Iterable[int],
+        outcome: str | bool,
+        *,
+        error: str = "",
+    ) -> None:
+        """Acknowledge, back off, or abandon one durable delivery batch."""
+        ids = (
+            [int(outbox_ids)]
+            if isinstance(outbox_ids, int)
+            else [int(item) for item in outbox_ids]
+        )
+        if not ids:
+            return
+        normalized = (
+            "ok"
+            if outcome is True
+            else "temporary_failure"
+            if outcome is False
+            else str(outcome)
+        )
+        if normalized not in {
+            "ok",
+            "missing",
+            "unavailable",
+            "temporary_failure",
+            "permanent_failure",
+        }:
+            normalized = "temporary_failure"
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds")
+        with self._lock, self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for outbox_id in ids:
+                row = conn.execute(
+                    "SELECT attempts FROM notification_outbox WHERE id = ?",
+                    (outbox_id,),
+                ).fetchone()
+                if not row:
+                    continue
+                attempts = int(row["attempts"]) + 1
+                delivered = normalized == "ok"
+                abandoned = normalized == "permanent_failure" or attempts >= 12
+                delay_seconds = min(1_800, 15 * (2 ** min(attempts, 7)))
+                next_attempt = (
+                    now_dt + timedelta(seconds=delay_seconds)
+                ).isoformat(timespec="seconds")
+                conn.execute(
+                    """
+                    UPDATE notification_outbox
+                    SET attempts = ?,
+                        status = CASE WHEN ? THEN 'delivered' ELSE status END,
+                        delivered_at = CASE WHEN ? THEN ? ELSE delivered_at END,
+                        next_attempt_at = CASE
+                            WHEN ? OR ? THEN NULL ELSE ?
+                        END,
+                        last_attempt_at = ?,
+                        last_error = ?,
+                        abandoned_at = CASE WHEN ? THEN ? ELSE abandoned_at END
+                    WHERE id = ?
+                    """,
+                    (
+                        attempts,
+                        int(delivered),
+                        int(delivered),
+                        now,
+                        int(delivered),
+                        int(abandoned),
+                        next_attempt,
+                        now,
+                        (error or normalized)[:500],
+                        int(abandoned and not delivered),
+                        now,
+                        outbox_id,
+                    ),
+                )
+            conn.execute("COMMIT")
 
 
 _store: Optional[SQLiteStore] = None

@@ -20,6 +20,12 @@ class UserActivityMiddleware(BaseMiddleware):
             chat_id, user = event.chat.id, event.from_user
         else:
             return await handler(event, data)
+        if getattr(event.message if isinstance(event, CallbackQuery) else event, "chat", None):
+            chat = event.message.chat if isinstance(event, CallbackQuery) else event.chat
+            if getattr(chat.type, "value", chat.type) != "private":
+                if isinstance(event, CallbackQuery):
+                    await event.answer("Бот работает только в личном чате.", show_alert=True)
+                return None
         if user:
             try:
                 await asyncio.to_thread(
@@ -44,7 +50,9 @@ class TradingAccessMiddleware(BaseMiddleware):
         "menu:history",
         "menu:auto_mode",
         "pos:",
+        "positions:",
         "auto:",
+        "trade:",
     )
 
     async def __call__(self, handler, event: TelegramObject, data: dict):
@@ -54,9 +62,6 @@ class TradingAccessMiddleware(BaseMiddleware):
         if not callback_data.startswith(self._protected_prefixes):
             return await handler(event, data)
         if event.from_user and event.from_user.id in ADMIN_TELEGRAM_IDS:
-            return await handler(event, data)
-        user = await asyncio.to_thread(get_store().get_user, event.message.chat.id)
-        if user.get("is_admin"):
             return await handler(event, data)
         await event.answer(
             "Торговый контур доступен только администратору бота.",
