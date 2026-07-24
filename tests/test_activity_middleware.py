@@ -40,6 +40,21 @@ class TradingAccessMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             show_alert=True,
         )
 
+    async def test_history_refresh_requires_current_admin(self):
+        middleware = TradingAccessMiddleware()
+        handler = AsyncMock(return_value="handled")
+        event = _callback("history:refresh:30:all", 9_876_543_210)
+
+        with patch.object(CallbackQuery, "answer", new=AsyncMock()) as answer:
+            result = await middleware(handler, event, {})
+
+        self.assertIsNone(result)
+        handler.assert_not_awaited()
+        answer.assert_awaited_once_with(
+            "Торговый контур доступен только администратору бота.",
+            show_alert=True,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

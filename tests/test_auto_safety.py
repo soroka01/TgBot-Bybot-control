@@ -438,6 +438,11 @@ class PreviewEntryBybit:
     def __init__(self):
         self.order = None
         self.entry_error = None
+        self.cancel_result = {
+            "orderStatus": "Cancelled",
+            "cumExecQty": "0",
+            "orderId": "cancelled-entry",
+        }
         self.calls = []
         self.leverage_calls = 0
         self.stop_event = None
@@ -512,6 +517,29 @@ class PreviewEntryBybit:
             raise self.entry_error
         return {"simulated": True}
 
+    def cancel_order_and_confirm(self, **order):
+        self.calls.append("cancel_order")
+        self.cancel_order = order
+        return dict(self.cancel_result)
+
+
+class RecordingTradeJournal:
+    def __init__(self, calls, *, fail_prepare=False):
+        self.calls = calls
+        self.fail_prepare = fail_prepare
+        self.prepared = None
+        self.updates = []
+
+    def prepare_entry(self, **payload):
+        self.calls.append("journal_prepare")
+        if self.fail_prepare:
+            raise RuntimeError("database unavailable")
+        self.prepared = payload
+
+    def update_setup(self, candidate_id, **changes):
+        self.calls.append("journal_update")
+        self.updates.append((candidate_id, changes))
+
 
 def preview_entry_case():
     now = datetime.now(timezone.utc)
@@ -580,6 +608,49 @@ class EntryExecutionTests(unittest.TestCase):
                 "create_order",
             ],
         )
+
+    def test_trade_plan_is_durable_before_exchange_entry(self):
+        bybit = PreviewEntryBybit()
+        journal = RecordingTradeJournal(bybit.calls)
+        cycle, fresh, candidate = preview_entry_case()
+        with (
+            patch("core.auto_trading._fresh_entry_state", return_value=fresh),
+            patch("core.auto_trading.notify"),
+        ):
+            _execute_candidate(
+                bybit,
+                candidate,
+                cycle,
+                {"BTCUSDT": Decimal("0.0006")},
+                threading.Event(),
+                journal=journal,
+                decision_item={"reason_code": "BEST_RR"},
+            )
+        self.assertLess(
+            bybit.calls.index("journal_prepare"),
+            bybit.calls.index("create_order"),
+        )
+        self.assertEqual(journal.prepared["order_link_id"], "open-candidate")
+        self.assertEqual(journal.prepared["decision"]["reason_code"], "BEST_RR")
+        self.assertEqual(journal.updates[-1][1]["status"], "previewed")
+
+    def test_journal_prepare_failure_prevents_live_write(self):
+        bybit = PreviewEntryBybit()
+        journal = RecordingTradeJournal(bybit.calls, fail_prepare=True)
+        cycle, fresh, candidate = preview_entry_case()
+        with patch("core.auto_trading._fresh_entry_state", return_value=fresh):
+            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+                _execute_candidate(
+                    bybit,
+                    candidate,
+                    cycle,
+                    {"BTCUSDT": Decimal("0.0006")},
+                    threading.Event(),
+                    journal=journal,
+                )
+        self.assertIn("journal_prepare", bybit.calls)
+        self.assertNotIn("create_order", bybit.calls)
+        self.assertIsNone(bybit.order)
 
     def test_stop_during_fresh_reads_prevents_leverage_and_order(self):
         bybit = PreviewEntryBybit()
@@ -772,6 +843,33 @@ class EntryExecutionTests(unittest.TestCase):
                     threading.Event(),
                 )
         self.assertTrue(flatten.call_args.kwargs["require_position"])
+
+    def test_confirmed_unfilled_cancellation_is_terminal_in_journal(self):
+        bybit = PreviewEntryBybit()
+        bybit.entry_error = BybitOrderConfirmationError(
+            "confirmation timed out",
+            order_link_id="open-candidate",
+        )
+        journal = RecordingTradeJournal(bybit.calls)
+        cycle, fresh, candidate = preview_entry_case()
+        with (
+            patch("core.auto_trading._fresh_entry_state", return_value=fresh),
+            patch(
+                "core.auto_trading._emergency_flatten_entry",
+                return_value=False,
+            ),
+        ):
+            with self.assertRaises(BybitOrderConfirmationError):
+                _execute_candidate(
+                    bybit,
+                    candidate,
+                    cycle,
+                    {"BTCUSDT": Decimal("0.0006")},
+                    threading.Event(),
+                    journal=journal,
+                )
+        self.assertIn("cancel_order", bybit.calls)
+        self.assertEqual(journal.updates[-1][1]["status"], "not_filled")
 
 
 class StrictAccountParsingTests(unittest.TestCase):

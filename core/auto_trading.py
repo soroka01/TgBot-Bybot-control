@@ -37,6 +37,7 @@ from core.decision_engine import (
 )
 from core.market_data import get_market_analysis
 from core.risk_engine import D, TradePlan, build_trade_plan, portfolio_risk_usd
+from core.trade_journal import TradeJournal
 from storage.database import get_store
 from utils.helpers import parse_account_overview, validate_sl_vs_liquidation
 from utils.logger_setup import logger
@@ -45,6 +46,7 @@ from utils.logger_setup import logger
 # All exchange mutations, including manual Telegram closes, share this lock.
 EXECUTION_LOCK = threading.RLock()
 FEE_REFRESH_SECONDS = 3_600
+TRADE_HISTORY_SYNC_SECONDS = 15 * 60
 MAX_SAFETY_CLOSE_ATTEMPTS = 3
 SUPPORTED_AUTO_MARGIN_MODES = {"REGULAR_MARGIN"}
 PARTIAL_TERMINAL_ORDER_STATUSES = {
@@ -884,6 +886,9 @@ def _execute_candidate(
     cycle: dict[str, Any],
     fee_rates: dict[str, Decimal],
     stop_event: threading.Event,
+    *,
+    journal: Optional[TradeJournal] = None,
+    decision_item: Optional[dict[str, Any]] = None,
 ) -> TradePlan:
     symbol = str(candidate["symbol"])
     try:
@@ -1005,6 +1010,65 @@ def _execute_candidate(
         raise ValueError("Snapshot устарел непосредственно перед отправкой ордера")
     if stop_event.is_set():
         raise ExecutionStopped("Авто-режим остановлен до отправки entry-ордера")
+
+    order_link_id = f"open-{plan.candidate_id}"[:36]
+    if journal is not None:
+        # This is intentionally the last durable operation before create-order.
+        # If it fails, a LIVE order must not be sent: otherwise a later audit
+        # could never reconstruct the exact plan approved by the risk engine.
+        journal.prepare_entry(
+            candidate=candidate,
+            plan=plan,
+            cycle=cycle,
+            decision=decision_item,
+            order_link_id=order_link_id,
+            sizing_context={
+                "entry_limit": str(entry_limit),
+                "position_idx": position_idx,
+                "taker_fee_rate": str(
+                    fee_rates.get(symbol, D(FALLBACK_TAKER_FEE_RATE))
+                ),
+                "equity_usd": str(final_state["account"]["equity_usd"]),
+                "available_usd": str(final_state["account"]["available_usd"]),
+                "portfolio_risk_usd": str(final_state["portfolio_risk"]),
+                "instrument": {
+                    "tick_size": str(rules.tick_size),
+                    "min_qty": str(rules.min_qty),
+                    "qty_step": str(rules.qty_step),
+                    "min_notional": str(rules.min_notional),
+                    "max_market_qty": str(rules.max_market_qty),
+                    "max_leverage": str(rules.max_leverage),
+                    "leverage_step": str(rules.leverage_step),
+                },
+            },
+            dry_run=DRY_RUN,
+        )
+
+    def update_journal(**changes: Any) -> None:
+        if journal is None:
+            return
+        try:
+            journal.update_setup(plan.candidate_id, **changes)
+        except Exception as error:
+            # Once an exchange mutation has happened, journal availability may
+            # never interrupt position confirmation, protection, or flattening.
+            logger.error(
+                f"{symbol}: не удалось обновить trade journal после entry: {error}"
+            )
+
+    if datetime.now(timezone.utc) >= valid_until:
+        update_journal(
+            status="failed",
+            last_error="Snapshot устарел во время записи trade journal",
+        )
+        raise ValueError("Snapshot устарел непосредственно перед отправкой ордера")
+    if stop_event.is_set():
+        update_journal(
+            status="stopped",
+            last_error="Авто-режим остановлен до отправки entry-ордера",
+        )
+        raise ExecutionStopped("Авто-режим остановлен до отправки entry-ордера")
+
     try:
         result = bybit.place_order_and_confirm(
             symbol=symbol,
@@ -1018,12 +1082,17 @@ def _execute_candidate(
             take_profit=plan.take_profit,
             stop_loss=plan.stop_loss,
             position_idx=position_idx,
-            order_link_id=f"open-{plan.candidate_id}"[:36],
+            order_link_id=order_link_id,
         )
     except BybitOrderNotFilledError as error:
         try:
             executed = _terminal_order_executed(error.order)
         except FatalExecutionError:
+            update_journal(
+                status="reconcile_required",
+                entry_order_id=error.order.get("orderId"),
+                last_error=str(error)[:500],
+            )
             _emergency_flatten_entry(
                 bybit,
                 symbol=symbol,
@@ -1034,6 +1103,18 @@ def _execute_candidate(
             )
             raise
         if executed:
+            update_journal(
+                status="reconcile_required",
+                entry_order_id=error.order.get("orderId"),
+                actual_entry_qty=error.order.get("cumExecQty"),
+                actual_entry_price=error.order.get("avgPrice"),
+                opened_at_ms=(
+                    error.order.get("updatedTime")
+                    or error.order.get("createdTime")
+                    or int(time.time() * 1_000)
+                ),
+                last_error=str(error)[:500],
+            )
             _emergency_flatten_entry(
                 bybit,
                 symbol=symbol,
@@ -1042,8 +1123,22 @@ def _execute_candidate(
                 reason="частичное исполнение входа",
                 require_position=True,
             )
+        else:
+            update_journal(
+                status="not_filled",
+                entry_order_id=error.order.get("orderId"),
+                last_error=str(error)[:500],
+            )
         raise
     except BybitOrderConfirmationError as error:
+        update_journal(
+            status="reconcile_required",
+            entry_order_link_id=error.order_link_id,
+            entry_order_id=error.order.get("orderId"),
+            actual_entry_qty=error.order.get("cumExecQty"),
+            actual_entry_price=error.order.get("avgPrice"),
+            last_error=str(error)[:500],
+        )
         try:
             final = bybit.cancel_order_and_confirm(
                 symbol=symbol,
@@ -1075,6 +1170,23 @@ def _execute_candidate(
                 require_position=False,
             )
             raise
+        update_journal(
+            status="reconcile_required" if executed else "not_filled",
+            entry_order_id=final.get("orderId"),
+            entry_order_link_id=final.get("orderLinkId") or error.order_link_id,
+            actual_entry_qty=final.get("cumExecQty"),
+            actual_entry_price=final.get("avgPrice"),
+            opened_at_ms=(
+                (
+                    final.get("updatedTime")
+                    or final.get("createdTime")
+                    or int(time.time() * 1_000)
+                )
+                if executed
+                else None
+            ),
+            last_error=str(error)[:500],
+        )
         _emergency_flatten_entry(
             bybit,
             symbol=symbol,
@@ -1084,7 +1196,11 @@ def _execute_candidate(
             require_position=executed,
         )
         raise
+    except Exception as error:
+        update_journal(status="failed", last_error=str(error)[:500])
+        raise
     if result.get("simulated"):
+        update_journal(status="previewed")
         notify(
             f"[{symbol}] 🧪 PREVIEW {plan.side}\n"
             f"qty {plan.quantity} · entry ≈ {plan.entry_price} · cap {entry_limit}\n"
@@ -1093,6 +1209,19 @@ def _execute_candidate(
         )
         return plan
 
+    update_journal(
+        status="entry_filled",
+        entry_order_id=result.get("orderId"),
+        entry_order_link_id=result.get("orderLinkId") or order_link_id,
+        actual_entry_qty=result.get("cumExecQty") or plan.quantity,
+        actual_entry_price=result.get("avgPrice") or plan.entry_price,
+        opened_at_ms=(
+            result.get("updatedTime")
+            or result.get("createdTime")
+            or int(time.time() * 1_000)
+        ),
+    )
+
     try:
         position = bybit.wait_for_position(
             symbol,
@@ -1100,6 +1229,10 @@ def _execute_candidate(
             lambda item: D(item.get("size", 0)) > 0,
         )
     except Exception as position_error:
+        update_journal(
+            status="reconcile_required",
+            last_error=str(position_error)[:500],
+        )
         # A Filled order without a visible position is an inconsistent state.
         # Stop the worker instead of proceeding to another cycle.
         raise FatalExecutionError(
@@ -1111,6 +1244,12 @@ def _execute_candidate(
         float(D(position.get("liqPrice") or 0)),
     )
     if not stop_safe:
+        update_journal(
+            status="reconcile_required",
+            actual_entry_qty=position.get("size"),
+            actual_entry_price=position.get("avgPrice"),
+            last_error=str(stop_reason)[:500],
+        )
         _emergency_flatten_entry(
             bybit,
             symbol=symbol,
@@ -1134,6 +1273,12 @@ def _execute_candidate(
             )
             protected = not position.get("simulated")
         except Exception as protection_error:
+            update_journal(
+                status="reconcile_required",
+                actual_entry_qty=position.get("size"),
+                actual_entry_price=position.get("avgPrice"),
+                last_error=str(protection_error)[:500],
+            )
             # A filled but unprotected position is more dangerous than a
             # missed setup.  Attempt a confirmed reduce-only exit.
             logger.critical(f"{symbol}: protection failed; emergency close")
@@ -1147,7 +1292,22 @@ def _execute_candidate(
             )
             raise protection_error
     if not protected:
+        update_journal(
+            status="reconcile_required",
+            last_error="Bybit не подтвердил TP/SL новой позиции",
+        )
         raise BybitAPIError(f"{symbol}: защита позиции не подтверждена")
+    update_journal(
+        status="open",
+        actual_entry_qty=position.get("size") or result.get("cumExecQty"),
+        actual_entry_price=position.get("avgPrice") or result.get("avgPrice"),
+        opened_at_ms=(
+            result.get("updatedTime")
+            or result.get("createdTime")
+            or int(time.time() * 1_000)
+        ),
+        last_error="",
+    )
     notify(
         f"[{symbol}] ✅ {plan.side} исполнен и защищён\n"
         f"qty {plan.quantity} · fill {result.get('avgPrice') or plan.entry_price}\n"
@@ -1163,6 +1323,8 @@ def execute_decisions(
     cycle: dict[str, Any],
     fee_rates: dict[str, Decimal],
     stop_event: threading.Event,
+    *,
+    journal: Optional[TradeJournal] = None,
 ) -> list[str]:
     """Serialize code-approved candidate entries and reserve each signal once."""
     actions: list[str] = []
@@ -1172,13 +1334,15 @@ def execute_decisions(
         logger.warning(f"Новые входы заблокированы: {cycle['entry_block_reason']}")
         return actions
 
+    store = journal.store if journal is not None else get_store()
+    trade_journal = journal or TradeJournal(bybit, store)
+
     for item in decisions:
         if item["action"] != "select_candidate" or stop_event.is_set():
             continue
         candidate = selected_candidate(item, cycle["snapshot"])
         if not candidate:
             continue
-        store = get_store()
         if not store.reserve_execution_signal(candidate["id"], candidate["symbol"]):
             logger.info(f"{candidate['symbol']}: кандидат уже обрабатывался")
             continue
@@ -1193,6 +1357,8 @@ def execute_decisions(
                     cycle,
                     fee_rates,
                     stop_event,
+                    journal=trade_journal,
+                    decision_item=item,
                 )
             store.update_execution_signal(
                 candidate["id"],
@@ -1236,6 +1402,7 @@ def main_loop(
     _set_runtime(state="starting", last_error=None)
     bybit: Optional[BybitAPI] = None
     deepseek: Optional[DeepSeekAPI] = None
+    trade_journal: Optional[TradeJournal] = None
     fatal_error: Optional[FatalExecutionError] = None
     try:
         bybit = BybitAPI()
@@ -1257,6 +1424,7 @@ def main_loop(
         deepseek.validate_model()
         fees = _fee_rates(bybit)
         fees_refreshed_at = time.monotonic()
+        trade_history_refreshed_at = 0.0
         # Model validation and fee reads may take time; never reuse the
         # startup safety snapshot for the first trading cycle.
         pending_preflight = None
@@ -1293,6 +1461,27 @@ def main_loop(
                     cycle,
                     event,
                 )
+                if (
+                    time.monotonic() - trade_history_refreshed_at
+                    >= TRADE_HISTORY_SYNC_SECONDS
+                ):
+                    trade_history_refreshed_at = time.monotonic()
+                    try:
+                        if trade_journal is None:
+                            trade_journal = TradeJournal(bybit, get_store())
+                        trade_journal.record_equity(
+                            cycle["account"],
+                            source="auto_cycle",
+                        )
+                        # A short rolling sync keeps completed trades durable
+                        # even when nobody opens the Telegram history screen.
+                        # Longer backfills are loaded on demand by that screen.
+                        trade_journal.sync_closed_pnl(lookback_days=7)
+                    except Exception as history_error:
+                        logger.warning(
+                            "Не удалось обновить локальную историю сделок; "
+                            f"торговая безопасность не затронута: {history_error}"
+                        )
                 if any(item.startswith("closed:") for item in safety_actions):
                     summary = "Защитные действия: " + ", ".join(safety_actions)
                     _set_runtime(last_summary=summary)
@@ -1330,6 +1519,7 @@ def main_loop(
                         cycle,
                         fees,
                         event,
+                        journal=trade_journal,
                     )
                     summary = "Действия: " + (", ".join(actions) if actions else "нет")
                     _set_runtime(last_summary=summary)

@@ -51,6 +51,7 @@ class TradingAccessMiddleware(BaseMiddleware):
         "menu:auto_mode",
         "pos:",
         "positions:",
+        "history:",
         "auto:",
         "trade:",
     )

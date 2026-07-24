@@ -22,8 +22,8 @@ from utils.logger_setup import logger
 
 # Импортируем все handlers
 from telegram_bot.handlers import (
-    activity, alerts, auto_mode, chart, fallbacks, market_overview, positions, settings,
-    start, trading,
+    activity, alerts, auto_mode, chart, fallbacks, history, market_overview,
+    positions, settings, start, trading,
 )
 from core.alert_scheduler import AlertScheduler
 from storage.database import get_store
@@ -131,6 +131,7 @@ async def main():
             # Регистрируем роутеры
             dp.include_router(start.router)
             dp.include_router(positions.router)
+            dp.include_router(history.router)
             dp.include_router(trading.router)
             dp.include_router(chart.router)
             dp.include_router(settings.router)

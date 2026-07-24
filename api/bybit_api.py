@@ -36,6 +36,7 @@ from config import (
 
 READ_ATTEMPTS = 3
 INSTRUMENT_CACHE_SECONDS = 3_600
+MAX_HISTORY_WINDOW_MS = 7 * 24 * 60 * 60 * 1_000
 TERMINAL_ORDER_STATUSES = {
     "Filled",
     "Cancelled",
@@ -540,6 +541,18 @@ class BybitAPI:
         return rules
 
     # ---- Account and positions ---------------------------------------------
+    def get_account_user_id(self) -> str:
+        """Return only the stable Bybit UID, never the API-key metadata."""
+        response = self._private_request("GET", "/v5/user/query-api", params={})
+        result = response.get("result")
+        user_id = str(result.get("userID") or "") if isinstance(result, dict) else ""
+        if not user_id.isascii() or not user_id.isdigit() or int(user_id) <= 0:
+            raise BybitAPIError(
+                "Bybit /v5/user/query-api не вернул корректный userID",
+                response=response,
+            )
+        return user_id
+
     def get_positions(
         self,
         symbol: Optional[str] = None,
@@ -1028,6 +1041,37 @@ class BybitAPI:
         end_time: Optional[int] = None,
         all_pages: bool = False,
     ) -> dict:
+        parsed_times: dict[str, int] = {}
+        for name, value in (
+            ("start_time", start_time),
+            ("end_time", end_time),
+        ):
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                raise ValueError(
+                    f"{name} должен быть timestamp в миллисекундах"
+                )
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"{name} должен быть timestamp в миллисекундах"
+                ) from error
+            if parsed < 0:
+                raise ValueError(f"{name} не может быть отрицательным")
+            parsed_times[name] = parsed
+        if start_time is not None:
+            start_time = parsed_times["start_time"]
+        if end_time is not None:
+            end_time = parsed_times["end_time"]
+        if start_time is not None and end_time is not None:
+            start_value = int(start_time)
+            end_value = int(end_time)
+            if end_value < start_value:
+                raise ValueError("end_time должен быть не раньше start_time")
+            if end_value - start_value > MAX_HISTORY_WINDOW_MS:
+                raise ValueError("Окно Closed PnL не может превышать 7 дней")
         base_params: dict[str, Any] = {
             "category": BYBIT_CATEGORY,
             "limit": max(1, min(limit, 100)),

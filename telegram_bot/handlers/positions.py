@@ -181,61 +181,6 @@ def close_all_positions() -> tuple[int, list[str]]:
         bybit.close()
 
 
-def build_history_view():
-    """Build a concise history screen using actual fees returned by Bybit."""
-    bybit = BybitAPI()
-    try:
-        trades = bybit.get_closed_pnl(limit=20).get("result", {}).get("list", [])
-    finally:
-        bybit.close()
-    if not trades:
-        return "📜 <b>История сделок</b>\n\nИстория пуста.", get_main_menu()
-
-    total_pnl = sum(to_float(trade.get("closedPnl")) for trade in trades)
-    fees = [
-        to_float(trade.get("openFee")) + to_float(trade.get("closeFee"))
-        for trade in trades
-        if "openFee" in trade or "closeFee" in trade
-    ]
-    sections: list[str] = []
-    current_length = 0
-    for trade in trades:
-        symbol = html.escape(str(trade.get("symbol", "")))
-        side = html.escape(str(trade.get("side", "")))
-        quantity = to_float(trade.get("qty"))
-        entry = to_float(trade.get("avgEntryPrice"))
-        exit_price = to_float(trade.get("avgExitPrice"))
-        pnl = to_float(trade.get("closedPnl"))
-        leverage = to_float(trade.get("leverage"), 1)
-        has_fee = "openFee" in trade or "closeFee" in trade
-        fee = to_float(trade.get("openFee")) + to_float(trade.get("closeFee"))
-        item = (
-            f"{'🟢' if side == 'Buy' else '🔴'} <b>{symbol}</b> {side}\n"
-            f"  💰 <code>${quantity * entry:,.2f}</code> | ⚡ <code>{leverage:g}x</code>\n"
-            f"  📊 <code>{format_price(entry)}</code> → <code>{format_price(exit_price)}</code>\n"
-            f"  {'💚' if pnl >= 0 else '❤️'} Closed PnL: <code>${pnl:+.2f}</code>"
-            + (f" | Fee: <code>${fee:.2f}</code>" if has_fee else "")
-            + "\n\n"
-        )
-        if current_length + len(item) > 3_500:
-            break
-        sections.append(item)
-        current_length += len(item)
-
-    fee_line = (
-        f"💸 <b>Комиссии Bybit:</b> <code>${sum(fees):.2f}</code>"
-        if fees
-        else "💸 <i>Комиссии не возвращены API для этих записей</i>"
-    )
-    text = (
-        f"📜 <b>История сделок ({len(sections)} из {len(trades)})</b>\n\n"
-        + "".join(sections)
-        + f"{'💚' if total_pnl >= 0 else '❤️'} <b>Closed PnL:</b> <code>${total_pnl:+.2f}</code>\n"
-        + fee_line
-    )
-    return text, get_main_menu()
-
-
 @router.callback_query(F.data == "menu:positions")
 async def callback_positions(callback: CallbackQuery):
     await callback.answer("Обновляю позиции...")
@@ -359,20 +304,5 @@ async def callback_close_all_confirm(callback: CallbackQuery):
         await render_callback_screen(
             callback.message,
             f"❌ <b>Не удалось закрыть позиции</b>\n\n<code>{html.escape(str(error)[:300])}</code>",
-            get_main_menu(),
-        )
-
-
-@router.callback_query(F.data == "menu:history")
-async def callback_history(callback: CallbackQuery):
-    await callback.answer("Загружаю историю...")
-    try:
-        text, markup = await asyncio.to_thread(build_history_view)
-        await render_callback_screen(callback.message, text, markup)
-    except Exception as error:
-        logger.error(f"Ошибка истории сделок: {error}")
-        await render_callback_screen(
-            callback.message,
-            f"❌ <b>Не удалось загрузить историю</b>\n\n<code>{html.escape(str(error)[:300])}</code>",
             get_main_menu(),
         )

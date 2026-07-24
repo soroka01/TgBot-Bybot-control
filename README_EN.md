@@ -1,6 +1,6 @@
 # 🤖 Crypto Trading Bot for Bybit
 
-> One Telegram message for controlling a Bybit Unified Account: positions, a live text chart, alerts, safe AI setup selection, and optional automated execution.
+> One Telegram message for controlling a Bybit Unified Account: positions, durable trade history and statistics, a live text chart, alerts, safe AI setup selection, and optional automated execution.
 
 🌐 **Language:** [Русский](README.md) · [English](README_EN.md)
 
@@ -19,7 +19,7 @@ The bot controls one shared Bybit Unified futures account and is designed for th
 | AI | Selects an existing `candidate_id`; cannot set quantity, leverage, TP, or SL |
 | Risk | Local code calculates size, fees, spread, slippage, net R/R, and leverage |
 | Bybit | Live instrument rules, stable `orderLinkId`, and execution reconciliation |
-| Storage | SQLite for screens, alerts, activity, outbox, and signal deduplication |
+| Storage | SQLite for exact entry plans, Closed PnL, equity snapshots, profiles, alerts, and outbox |
 | Default | `TRADING_MODE=dry`; mutating requests never reach the exchange |
 
 > ⚠️ This is a technical risk-control tool, not financial advice. Losing trades, slippage, liquidation, API failures, and loss of capital remain possible.
@@ -36,7 +36,7 @@ The bot controls one shared Bybit Unified futures account and is designed for th
 - Auto events appear as a small banner without destroying the current route.
 - After restart, a persisted screen is changed to an honest “bot restarted” state.
 
-A PNG chart is intentionally not used. Telegram can convert text to media, but returning to text is awkward and media captions are limited to 1,024 characters. The `📈 Live chart` screen therefore uses an accessible, fast sparkline built from confirmed closed candles:
+A PNG chart is intentionally not used. Telegram can convert text to media, but returning to text is awkward and media captions are limited to 1,024 characters. Market and trade screens therefore use accessible, fast sparklines built from confirmed closed candles and cumulative PnL:
 
 ```text
 BTCUSDT · 15m
@@ -71,7 +71,8 @@ The default is the current `deepseek-v4-flash` model with JSON Output and thinki
 - new entries are also blocked by an unprotected position, exposure-increasing open order, unsafe position status, unsupported USDC/inverse/options exposure, malformed account-wide balance fields, or the daily loss guard;
 - automatic stops may tighten but never widen;
 - exits are owned only by TP/SL, deterministic safety guards, or an owner-confirmed manual action; implicit reversals are prohibited;
-- each candle candidate can be reserved only once in SQLite.
+- each candle candidate can be reserved only once in SQLite;
+- the final plan, AI reason, snapshot, and sizing context are committed before `create-order`; failure of this mandatory write blocks a new LIVE entry.
 
 ### Reliable Bybit execution
 
@@ -85,7 +86,7 @@ The default is the current `deepseek-v4-flash` model with JSON Output and thinki
 - A partially filled safety exit is immediately reconciled and retried a bounded number of times; an uncertain remainder fail-stops auto mode.
 - `set_trading_stop` always sends paired TP and SL with `tpslMode=Full`, Market execution, and MarkPrice triggers.
 - Signature time is synchronized with Bybit and rate-limit headers are respected.
-- Positions and active orders are paginated.
+- Positions, active orders, and Closed PnL are paginated.
 
 ## Screens
 
@@ -99,9 +100,19 @@ The default is the current `deepseek-v4-flash` model with JSON Output and thinki
 | 🤖 Auto | Lifecycle, mode, limits, last cycle, and error | 5s |
 | 🔔 Alerts | Price/RSI crossing, once/repeat | 15s scheduler |
 | 🧾 Activity | Personal activity log | On request |
-| 📜 Trades | Bybit Closed PnL | On request |
+| 📜 Trades | PnL curve, statistics, and recent trades over 1D–1Y | On request + 15m sync |
 
 Trading, account, and AI callbacks are restricted to IDs in `ADMIN_TELEGRAM_IDS`. Group chats are blocked. Persisted SQLite `is_admin` is never an authorization source.
+
+### Trade history and statistics
+
+- Periods are rolling `24/7/14/30/90/180/365` days, with a switch between bot-attributed trades and the complete linear USDT account.
+- Bybit Closed PnL is fetched through every cursor page in windows no wider than seven days. The auto loop refreshes the latest seven days every 15 minutes, while the screen backfills the selected period on demand.
+- `closedPnl` is the authoritative net PnL: Bybit already includes trading fees and funding. `openFee`/`closeFee` are retained as a cost breakdown and are never subtracted twice.
+- Partial closes attributed to one bot candidate are grouped into one logical trade. External and manual account closes remain individual exchange records.
+- The audit layer calculates net/gross PnL, W/L/BE, win rate, profit factor, expectancy, median, average win/loss, payoff, drawdown/recovery, streaks, fees, turnover, hold time, R/SQN, Long/Short, and per-symbol statistics. Telegram keeps a compact subset plus five recent trades, and exposes a metric only when enough data exists.
+- SQLite retains the original Bybit record, exact local plan, snapshot, selector decision, and sizing context for later auditing without overloading Telegram.
+- Equity change and account-level drawdown percentages appear only after equity snapshots exist. They are not cash-flow adjusted, so Closed PnL remains the primary strategy measure. Sharpe/Sortino are intentionally omitted without a sufficient, correctly sampled daily equity curve.
 
 ## Architecture
 
@@ -116,7 +127,11 @@ Telegram update
                   ├─> deterministic candidates
                   ├─> DeepSeek selector
                   ├─> deterministic risk engine
+                  ├─> durable trade plan before entry
                   └─> serialized Bybit execution + reconciliation
+
+Bybit Closed PnL ──> 7-day cursor sync ──> SQLite trade journal
+                                               └─> Decimal analytics ──> one-message screen
 ```
 
 ```text
@@ -128,10 +143,14 @@ core/
   risk_engine.py        Decimal sizing, costs, gates, portfolio risk
   market_data.py        closed candles and technical features
   chart.py              text sparkline
+  trade_journal.py       account-scoped Closed PnL sync and entry audit trail
+  trade_analytics.py     Decimal metrics and partial-close grouping
   auto_trading.py       cycle and serialized side effects
   alerts.py             crossing logic
-storage/database.py     SQLite repository, dedupe, and notification outbox
+storage/database.py     SQLite repository, trade history, equity, and outbox
 telegram_bot/ui.py      one-message state, locks, revisions, and live tasks
+telegram_bot/handlers/
+  history.py            compact period/scope performance screen
 tests/                  network-free safety tests
 ```
 
@@ -187,7 +206,7 @@ LIVE_TRADING_CONFIRMATION=I_ACCEPT_LIVE_TRADING_RISK
 
 A typo cannot enable LIVE; startup fails instead. Legacy `DRY_RUN` is accepted only as a migration fallback. New configurations should use `TRADING_MODE`.
 
-`dry` is a preview, not a local paper ledger: GET requests are real but POST requests are blocked. Use a separate Bybit Demo/Testnet account for realistic fills and position state, never a mainnet key.
+`dry` is a preview without fabricated paper PnL: GET requests are real but POST requests are blocked. The selector decision and calculated plan are kept for auditing but excluded from real-trade performance. Use a separate Bybit Demo/Testnet account for actual fills and position state, never a mainnet key.
 
 ### Main limits
 
@@ -226,7 +245,7 @@ python -m compileall -q main.py config.py api core storage telegram_bot tests ut
 git diff --check
 ```
 
-Tests cover HMAC, malformed API responses, blind-POST prevention, reconciliation and partial fills, paired TP/SL, dynamic precision, strict AI contracts, stale snapshots, closed candles, sparkline rendering, risk sizing, portfolio/daily guards, durable outbox, and the single-message UI.
+Tests cover HMAC, malformed API responses, blind-POST prevention, reconciliation and partial fills, paired TP/SL, dynamic precision, strict AI contracts, stale snapshots, closed candles, journal-before-entry, idempotent seven-day backfill, Decimal metrics, sparkline rendering, risk sizing, portfolio/daily guards, durable outbox, and the single-message UI.
 
 Use Bybit Demo/Testnet for integration checks. Repository tests never submit orders.
 
@@ -234,11 +253,13 @@ Use Bybit Demo/Testnet for integration checks. Repository tests never submit ord
 
 | Path | Data |
 | --- | --- |
-| `data/crypto_bot.sqlite3` | Profiles, screens, alerts, outbox, activity, signal dedupe, and UTC equity high-water |
+| `data/crypto_bot.sqlite3` | Entry plans, raw Closed PnL, sync watermarks, equity snapshots, profiles, screens, alerts, outbox, and activity |
 | `crypto_bot.log` | Rotating runtime log with 10-day retention |
 | `api/deepseek_logs/` | Only when `DEEPSEEK_LOG_RESPONSES=true` |
 
 DeepSeek response logging is disabled by default. When enabled, only the model, `snapshot_id`, and final JSON are persisted—not raw wallet context or reasoning.
+
+The trade journal is scoped by the official Bybit environment and numeric account UID. API key/secret and the full `/v5/user/query-api` response are never stored; only a one-way SHA-256 key fingerprint remains for verified offline-cache access. The SQLite file contains sensitive trading history: do not publish it, and include it in backups.
 
 Use a Bybit API key with read/trade permissions and **without withdrawal permission**.
 
@@ -247,6 +268,7 @@ Use a Bybit API key with read/trade permissions and **without withdrawal permiss
 - The bot supports linear USDT contracts and one process/one Unified Account; automated entries require `REGULAR_MARGIN`.
 - SQLite does not coordinate multiple simultaneously running application instances.
 - REST reconciliation is safer than trusting an ACK, but a private WebSocket could further reduce latency.
+- Initial statistics are limited by available Bybit Closed PnL and locally accumulated snapshots; the bot backfills at most the selected year and does not later delete those trade records.
 - Auto mode is deliberately conservative and may find no setup for long periods.
 - Editing an existing Telegram message usually does not produce a full push notification. Alerts are durable in-app banners, not a must-not-miss channel.
 - CoinGecko, Telegram, DeepSeek, and Bybit may be unavailable or change rate limits.

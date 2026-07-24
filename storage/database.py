@@ -13,6 +13,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
@@ -24,8 +25,30 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _json_payload(value: Optional[dict[str, Any]]) -> Optional[str]:
+    if value is None:
+        return None
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _hex_digest(value: str, length: int, label: str) -> str:
+    normalized = str(value).strip().lower()
+    if (
+        len(normalized) != length
+        or any(character not in "0123456789abcdef" for character in normalized)
+    ):
+        raise ValueError(f"{label} must be a {length}-character hex digest")
+    return normalized
+
+
 class SQLiteStore:
-    """Repository with one schema for users, alerts and activity."""
+    """Repository for Telegram state, risk controls, and the trade journal."""
 
     def __init__(self, path: Path = DATABASE_PATH) -> None:
         self.path = Path(path)
@@ -146,6 +169,103 @@ class SQLiteStore:
                     abandoned_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS trade_account_aliases (
+                    api_fingerprint TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    verified_uid INTEGER NOT NULL DEFAULT 1
+                        CHECK(verified_uid = 1),
+                    verified_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS trade_setups (
+                    account_scope TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    snapshot_id TEXT,
+                    strategy_version TEXT NOT NULL DEFAULT 'trend_atr.v1',
+                    selector_reason TEXT,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL CHECK(side IN ('Buy', 'Sell')),
+                    status TEXT NOT NULL,
+                    dry_run INTEGER NOT NULL DEFAULT 0,
+                    entry_order_link_id TEXT,
+                    entry_order_id TEXT,
+                    planned_qty TEXT,
+                    planned_entry_price TEXT,
+                    planned_take_profit TEXT,
+                    planned_stop_loss TEXT,
+                    planned_leverage TEXT,
+                    planned_risk_usd TEXT,
+                    planned_reward_usd TEXT,
+                    planned_cost_usd TEXT,
+                    planned_net_rr TEXT,
+                    actual_entry_qty TEXT,
+                    actual_entry_price TEXT,
+                    opened_at_ms INTEGER,
+                    closed_at_ms INTEGER,
+                    decision_json TEXT,
+                    snapshot_json TEXT,
+                    sizing_context_json TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(account_scope, candidate_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS closed_trade_records (
+                    account_scope TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    order_id TEXT,
+                    candidate_id TEXT,
+                    symbol TEXT NOT NULL,
+                    close_side TEXT,
+                    position_side TEXT,
+                    order_type TEXT,
+                    exec_type TEXT,
+                    qty TEXT,
+                    closed_size TEXT,
+                    order_price TEXT,
+                    avg_entry_price TEXT,
+                    avg_exit_price TEXT,
+                    cum_entry_value TEXT,
+                    cum_exit_value TEXT,
+                    closed_pnl TEXT NOT NULL,
+                    open_fee TEXT,
+                    close_fee TEXT,
+                    fee_data_complete INTEGER NOT NULL DEFAULT 0,
+                    leverage TEXT,
+                    fill_count INTEGER,
+                    created_time_ms INTEGER NOT NULL,
+                    updated_time_ms INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    synced_at TEXT NOT NULL,
+                    PRIMARY KEY(account_scope, record_id),
+                    FOREIGN KEY(account_scope, candidate_id)
+                        REFERENCES trade_setups(account_scope, candidate_id)
+                        ON DELETE NO ACTION
+                );
+
+                CREATE TABLE IF NOT EXISTS trade_sync_state (
+                    account_scope TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    coverage_start_ms INTEGER NOT NULL,
+                    coverage_end_ms INTEGER NOT NULL,
+                    last_success_ms INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(account_scope, source)
+                );
+
+                CREATE TABLE IF NOT EXISTS equity_snapshots (
+                    account_scope TEXT NOT NULL,
+                    bucket_time_ms INTEGER NOT NULL,
+                    captured_at_ms INTEGER NOT NULL,
+                    equity_usd TEXT NOT NULL,
+                    wallet_balance_usd TEXT,
+                    available_usd TEXT,
+                    unrealized_pnl_usd TEXT,
+                    source TEXT NOT NULL,
+                    PRIMARY KEY(account_scope, bucket_time_ms)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_alerts_active
                     ON alerts(is_enabled, kind, symbol, timeframe);
                 CREATE INDEX IF NOT EXISTS idx_alerts_chat ON alerts(chat_id, is_enabled);
@@ -157,8 +277,49 @@ class SQLiteStore:
                     ON daily_risk_state(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_outbox_pending
                     ON notification_outbox(status, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_setup_entry_link
+                    ON trade_setups(account_scope, entry_order_link_id)
+                    WHERE entry_order_link_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_trade_setup_open
+                    ON trade_setups(account_scope, symbol, status, opened_at_ms DESC);
+                CREATE INDEX IF NOT EXISTS idx_closed_trade_scope_time
+                    ON closed_trade_records(account_scope, updated_time_ms DESC);
+                CREATE INDEX IF NOT EXISTS idx_closed_trade_candidate
+                    ON closed_trade_records(account_scope, candidate_id, updated_time_ms);
+                CREATE INDEX IF NOT EXISTS idx_equity_scope_time
+                    ON equity_snapshots(account_scope, captured_at_ms);
                 """
             )
+            # An early unreleased revision used the same table name for
+            # unverified fallback aliases.  Only the canonical schema below can
+            # be trusted as a UID-verified offline cache; incompatible rows are
+            # securely discarded instead of being silently promoted.
+            alias_columns = tuple(
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(trade_account_aliases)"
+                )
+            )
+            canonical_alias_columns = (
+                "api_fingerprint",
+                "account_scope",
+                "verified_uid",
+                "verified_at",
+            )
+            if alias_columns != canonical_alias_columns:
+                conn.execute("PRAGMA secure_delete = ON")
+                conn.execute("DROP TABLE trade_account_aliases")
+                conn.execute(
+                    """
+                    CREATE TABLE trade_account_aliases (
+                        api_fingerprint TEXT PRIMARY KEY,
+                        account_scope TEXT NOT NULL,
+                        verified_uid INTEGER NOT NULL DEFAULT 1
+                            CHECK(verified_uid = 1),
+                        verified_at TEXT NOT NULL
+                    )
+                    """
+                )
             # Add retry metadata to databases created by older revisions.
             outbox_columns = {
                 str(row["name"])
@@ -486,6 +647,1305 @@ class SQLiteStore:
                 """,
                 (status, _utcnow(), candidate_id),
             )
+
+    def get_verified_trade_account_scope(
+        self,
+        api_fingerprint: str,
+    ) -> Optional[str]:
+        """Return only a scope previously verified through Bybit userID."""
+        fingerprint = _hex_digest(
+            api_fingerprint,
+            64,
+            "API fingerprint",
+        )
+        with self._lock, self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT account_scope
+                FROM trade_account_aliases
+                WHERE api_fingerprint = ? AND verified_uid = 1
+                """,
+                (fingerprint,),
+            ).fetchone()
+        return str(row["account_scope"]) if row else None
+
+    def save_verified_trade_account_scope(
+        self,
+        api_fingerprint: str,
+        account_scope: str,
+    ) -> None:
+        """Cache a mapping only after the caller verified Bybit userID."""
+        fingerprint = _hex_digest(
+            api_fingerprint,
+            64,
+            "API fingerprint",
+        )
+        scope = _hex_digest(account_scope, 24, "Account scope")
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO trade_account_aliases (
+                    api_fingerprint, account_scope, verified_uid, verified_at
+                ) VALUES (?, ?, 1, ?)
+                ON CONFLICT(api_fingerprint) DO UPDATE SET
+                    account_scope = excluded.account_scope,
+                    verified_uid = 1,
+                    verified_at = excluded.verified_at
+                """,
+                (fingerprint, scope, _utcnow()),
+            )
+
+    def migrate_trade_account_scope(
+        self,
+        fallback_scope: str,
+        uid_scope: str,
+        *,
+        verified_api_fingerprint: Optional[str] = None,
+    ) -> None:
+        """Atomically fold transient fallback rows into the stable UID scope.
+
+        When a verified fingerprint is supplied, its UID mapping is committed
+        in the same transaction. The fallback scope itself is never aliased.
+        """
+        source_scope = _hex_digest(
+            fallback_scope,
+            24,
+            "Fallback account scope",
+        )
+        target_scope = _hex_digest(uid_scope, 24, "UID account scope")
+        verified_fingerprint = (
+            _hex_digest(
+                verified_api_fingerprint,
+                64,
+                "API fingerprint",
+            )
+            if verified_api_fingerprint is not None
+            else None
+        )
+        if source_scope == target_scope:
+            if verified_fingerprint is not None:
+                self.save_verified_trade_account_scope(
+                    verified_fingerprint,
+                    target_scope,
+                )
+            return
+
+        setup_columns = (
+            "candidate_id", "snapshot_id", "strategy_version",
+            "selector_reason", "symbol", "side", "status", "dry_run",
+            "entry_order_link_id", "entry_order_id", "planned_qty",
+            "planned_entry_price", "planned_take_profit", "planned_stop_loss",
+            "planned_leverage", "planned_risk_usd", "planned_reward_usd",
+            "planned_cost_usd", "planned_net_rr", "actual_entry_qty",
+            "actual_entry_price", "opened_at_ms", "closed_at_ms",
+            "decision_json", "snapshot_json", "sizing_context_json",
+            "last_error", "created_at", "updated_at",
+        )
+        closed_columns = (
+            "record_id", "order_id", "candidate_id", "symbol", "close_side",
+            "position_side", "order_type", "exec_type", "qty", "closed_size",
+            "order_price", "avg_entry_price", "avg_exit_price",
+            "cum_entry_value", "cum_exit_value", "closed_pnl", "open_fee",
+            "close_fee", "fee_data_complete", "leverage", "fill_count",
+            "created_time_ms", "updated_time_ms", "raw_json", "synced_at",
+        )
+
+        with self._lock, self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                setup_rows = conn.execute(
+                    "SELECT * FROM trade_setups WHERE account_scope = ?",
+                    (source_scope,),
+                ).fetchall()
+                setup_names = ", ".join(("account_scope", *setup_columns))
+                setup_placeholders = ", ".join("?" for _ in range(len(setup_columns) + 1))
+                for row in setup_rows:
+                    conn.execute(
+                        f"""
+                        INSERT INTO trade_setups ({setup_names})
+                        VALUES ({setup_placeholders})
+                        ON CONFLICT(account_scope, candidate_id) DO UPDATE SET
+                            snapshot_id = COALESCE(
+                                trade_setups.snapshot_id, excluded.snapshot_id
+                            ),
+                            strategy_version = CASE
+                                WHEN excluded.updated_at > trade_setups.updated_at
+                                THEN excluded.strategy_version
+                                ELSE trade_setups.strategy_version
+                            END,
+                            selector_reason = COALESCE(
+                                trade_setups.selector_reason,
+                                excluded.selector_reason
+                            ),
+                            status = CASE
+                                WHEN excluded.updated_at > trade_setups.updated_at
+                                THEN excluded.status ELSE trade_setups.status
+                            END,
+                            entry_order_link_id = COALESCE(
+                                trade_setups.entry_order_link_id,
+                                excluded.entry_order_link_id
+                            ),
+                            entry_order_id = COALESCE(
+                                trade_setups.entry_order_id,
+                                excluded.entry_order_id
+                            ),
+                            planned_qty = COALESCE(
+                                trade_setups.planned_qty, excluded.planned_qty
+                            ),
+                            planned_entry_price = COALESCE(
+                                trade_setups.planned_entry_price,
+                                excluded.planned_entry_price
+                            ),
+                            planned_take_profit = COALESCE(
+                                trade_setups.planned_take_profit,
+                                excluded.planned_take_profit
+                            ),
+                            planned_stop_loss = COALESCE(
+                                trade_setups.planned_stop_loss,
+                                excluded.planned_stop_loss
+                            ),
+                            planned_leverage = COALESCE(
+                                trade_setups.planned_leverage,
+                                excluded.planned_leverage
+                            ),
+                            planned_risk_usd = COALESCE(
+                                trade_setups.planned_risk_usd,
+                                excluded.planned_risk_usd
+                            ),
+                            planned_reward_usd = COALESCE(
+                                trade_setups.planned_reward_usd,
+                                excluded.planned_reward_usd
+                            ),
+                            planned_cost_usd = COALESCE(
+                                trade_setups.planned_cost_usd,
+                                excluded.planned_cost_usd
+                            ),
+                            planned_net_rr = COALESCE(
+                                trade_setups.planned_net_rr,
+                                excluded.planned_net_rr
+                            ),
+                            actual_entry_qty = COALESCE(
+                                trade_setups.actual_entry_qty,
+                                excluded.actual_entry_qty
+                            ),
+                            actual_entry_price = COALESCE(
+                                trade_setups.actual_entry_price,
+                                excluded.actual_entry_price
+                            ),
+                            opened_at_ms = COALESCE(
+                                trade_setups.opened_at_ms, excluded.opened_at_ms
+                            ),
+                            closed_at_ms = CASE
+                                WHEN trade_setups.closed_at_ms IS NULL
+                                THEN excluded.closed_at_ms
+                                WHEN excluded.closed_at_ms IS NULL
+                                THEN trade_setups.closed_at_ms
+                                ELSE MAX(
+                                    trade_setups.closed_at_ms,
+                                    excluded.closed_at_ms
+                                )
+                            END,
+                            decision_json = COALESCE(
+                                trade_setups.decision_json,
+                                excluded.decision_json
+                            ),
+                            snapshot_json = COALESCE(
+                                trade_setups.snapshot_json,
+                                excluded.snapshot_json
+                            ),
+                            sizing_context_json = COALESCE(
+                                trade_setups.sizing_context_json,
+                                excluded.sizing_context_json
+                            ),
+                            last_error = CASE
+                                WHEN excluded.updated_at > trade_setups.updated_at
+                                THEN excluded.last_error
+                                ELSE trade_setups.last_error
+                            END,
+                            created_at = MIN(
+                                trade_setups.created_at, excluded.created_at
+                            ),
+                            updated_at = MAX(
+                                trade_setups.updated_at, excluded.updated_at
+                            )
+                        """,
+                        (target_scope, *(row[name] for name in setup_columns)),
+                    )
+
+                closed_rows = conn.execute(
+                    "SELECT * FROM closed_trade_records WHERE account_scope = ?",
+                    (source_scope,),
+                ).fetchall()
+                closed_names = ", ".join(("account_scope", *closed_columns))
+                closed_placeholders = ", ".join(
+                    "?" for _ in range(len(closed_columns) + 1)
+                )
+                for row in closed_rows:
+                    conn.execute(
+                        f"""
+                        INSERT INTO closed_trade_records ({closed_names})
+                        VALUES ({closed_placeholders})
+                        ON CONFLICT(account_scope, record_id) DO UPDATE SET
+                            candidate_id = COALESCE(
+                                closed_trade_records.candidate_id,
+                                excluded.candidate_id
+                            ),
+                            order_id = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.order_id,
+                                    closed_trade_records.order_id
+                                )
+                                ELSE closed_trade_records.order_id
+                            END,
+                            symbol = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN excluded.symbol
+                                ELSE closed_trade_records.symbol
+                            END,
+                            close_side = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.close_side,
+                                    closed_trade_records.close_side
+                                )
+                                ELSE closed_trade_records.close_side
+                            END,
+                            position_side = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.position_side,
+                                    closed_trade_records.position_side
+                                )
+                                ELSE closed_trade_records.position_side
+                            END,
+                            order_type = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.order_type,
+                                    closed_trade_records.order_type
+                                )
+                                ELSE closed_trade_records.order_type
+                            END,
+                            exec_type = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.exec_type,
+                                    closed_trade_records.exec_type
+                                )
+                                ELSE closed_trade_records.exec_type
+                            END,
+                            qty = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(excluded.qty, closed_trade_records.qty)
+                                ELSE closed_trade_records.qty
+                            END,
+                            closed_size = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.closed_size,
+                                    closed_trade_records.closed_size
+                                )
+                                ELSE closed_trade_records.closed_size
+                            END,
+                            order_price = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.order_price,
+                                    closed_trade_records.order_price
+                                )
+                                ELSE closed_trade_records.order_price
+                            END,
+                            avg_entry_price = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.avg_entry_price,
+                                    closed_trade_records.avg_entry_price
+                                )
+                                ELSE closed_trade_records.avg_entry_price
+                            END,
+                            avg_exit_price = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.avg_exit_price,
+                                    closed_trade_records.avg_exit_price
+                                )
+                                ELSE closed_trade_records.avg_exit_price
+                            END,
+                            cum_entry_value = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.cum_entry_value,
+                                    closed_trade_records.cum_entry_value
+                                )
+                                ELSE closed_trade_records.cum_entry_value
+                            END,
+                            cum_exit_value = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.cum_exit_value,
+                                    closed_trade_records.cum_exit_value
+                                )
+                                ELSE closed_trade_records.cum_exit_value
+                            END,
+                            closed_pnl = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN excluded.closed_pnl
+                                ELSE closed_trade_records.closed_pnl
+                            END,
+                            open_fee = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.open_fee,
+                                    closed_trade_records.open_fee
+                                )
+                                ELSE closed_trade_records.open_fee
+                            END,
+                            close_fee = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.close_fee,
+                                    closed_trade_records.close_fee
+                                )
+                                ELSE closed_trade_records.close_fee
+                            END,
+                            fee_data_complete = MAX(
+                                closed_trade_records.fee_data_complete,
+                                excluded.fee_data_complete
+                            ),
+                            leverage = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.leverage,
+                                    closed_trade_records.leverage
+                                )
+                                ELSE closed_trade_records.leverage
+                            END,
+                            fill_count = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN COALESCE(
+                                    excluded.fill_count,
+                                    closed_trade_records.fill_count
+                                )
+                                ELSE closed_trade_records.fill_count
+                            END,
+                            created_time_ms = MIN(
+                                closed_trade_records.created_time_ms,
+                                excluded.created_time_ms
+                            ),
+                            updated_time_ms = MAX(
+                                closed_trade_records.updated_time_ms,
+                                excluded.updated_time_ms
+                            ),
+                            raw_json = CASE
+                                WHEN excluded.updated_time_ms >=
+                                     closed_trade_records.updated_time_ms
+                                THEN excluded.raw_json
+                                ELSE closed_trade_records.raw_json
+                            END,
+                            synced_at = MAX(
+                                closed_trade_records.synced_at,
+                                excluded.synced_at
+                            )
+                        """,
+                        (target_scope, *(row[name] for name in closed_columns)),
+                    )
+
+                sync_rows = conn.execute(
+                    "SELECT * FROM trade_sync_state WHERE account_scope = ?",
+                    (source_scope,),
+                ).fetchall()
+                for row in sync_rows:
+                    conn.execute(
+                        """
+                        INSERT INTO trade_sync_state (
+                            account_scope, source, coverage_start_ms,
+                            coverage_end_ms, last_success_ms, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(account_scope, source) DO UPDATE SET
+                            coverage_start_ms = MIN(
+                                trade_sync_state.coverage_start_ms,
+                                excluded.coverage_start_ms
+                            ),
+                            coverage_end_ms = MAX(
+                                trade_sync_state.coverage_end_ms,
+                                excluded.coverage_end_ms
+                            ),
+                            last_success_ms = MAX(
+                                trade_sync_state.last_success_ms,
+                                excluded.last_success_ms
+                            ),
+                            updated_at = MAX(
+                                trade_sync_state.updated_at,
+                                excluded.updated_at
+                            )
+                        """,
+                        (
+                            target_scope,
+                            row["source"],
+                            row["coverage_start_ms"],
+                            row["coverage_end_ms"],
+                            row["last_success_ms"],
+                            row["updated_at"],
+                        ),
+                    )
+
+                equity_rows = conn.execute(
+                    "SELECT * FROM equity_snapshots WHERE account_scope = ?",
+                    (source_scope,),
+                ).fetchall()
+                for row in equity_rows:
+                    conn.execute(
+                        """
+                        INSERT INTO equity_snapshots (
+                            account_scope, bucket_time_ms, captured_at_ms,
+                            equity_usd, wallet_balance_usd, available_usd,
+                            unrealized_pnl_usd, source
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(account_scope, bucket_time_ms) DO UPDATE SET
+                            captured_at_ms = CASE
+                                WHEN excluded.captured_at_ms >=
+                                     equity_snapshots.captured_at_ms
+                                THEN excluded.captured_at_ms
+                                ELSE equity_snapshots.captured_at_ms
+                            END,
+                            equity_usd = CASE
+                                WHEN excluded.captured_at_ms >=
+                                     equity_snapshots.captured_at_ms
+                                THEN excluded.equity_usd
+                                ELSE equity_snapshots.equity_usd
+                            END,
+                            wallet_balance_usd = COALESCE(
+                                equity_snapshots.wallet_balance_usd,
+                                excluded.wallet_balance_usd
+                            ),
+                            available_usd = COALESCE(
+                                equity_snapshots.available_usd,
+                                excluded.available_usd
+                            ),
+                            unrealized_pnl_usd = COALESCE(
+                                equity_snapshots.unrealized_pnl_usd,
+                                excluded.unrealized_pnl_usd
+                            ),
+                            source = CASE
+                                WHEN excluded.captured_at_ms >=
+                                     equity_snapshots.captured_at_ms
+                                THEN excluded.source
+                                ELSE equity_snapshots.source
+                            END
+                        """,
+                        (
+                            target_scope,
+                            row["bucket_time_ms"],
+                            row["captured_at_ms"],
+                            row["equity_usd"],
+                            row["wallet_balance_usd"],
+                            row["available_usd"],
+                            row["unrealized_pnl_usd"],
+                            row["source"],
+                        ),
+                    )
+
+                conn.execute(
+                    "DELETE FROM closed_trade_records WHERE account_scope = ?",
+                    (source_scope,),
+                )
+                conn.execute(
+                    "DELETE FROM trade_setups WHERE account_scope = ?",
+                    (source_scope,),
+                )
+                conn.execute(
+                    "DELETE FROM trade_sync_state WHERE account_scope = ?",
+                    (source_scope,),
+                )
+                conn.execute(
+                    "DELETE FROM equity_snapshots WHERE account_scope = ?",
+                    (source_scope,),
+                )
+                if verified_fingerprint is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO trade_account_aliases (
+                            api_fingerprint, account_scope, verified_uid,
+                            verified_at
+                        ) VALUES (?, ?, 1, ?)
+                        ON CONFLICT(api_fingerprint) DO UPDATE SET
+                            account_scope = excluded.account_scope,
+                            verified_uid = 1,
+                            verified_at = excluded.verified_at
+                        """,
+                        (
+                            verified_fingerprint,
+                            target_scope,
+                            _utcnow(),
+                        ),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def upsert_trade_setup(
+        self,
+        *,
+        account_scope: str,
+        candidate_id: str,
+        snapshot_id: Optional[str],
+        symbol: str,
+        side: str,
+        status: str,
+        dry_run: bool,
+        entry_order_link_id: Optional[str] = None,
+        strategy_version: str = "trend_atr.v1",
+        selector_reason: Optional[str] = None,
+        plan: Optional[dict[str, Any]] = None,
+        decision: Optional[dict[str, Any]] = None,
+        snapshot: Optional[dict[str, Any]] = None,
+        sizing_context: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Durably store a bot setup before a live entry can be submitted."""
+        if not account_scope or not candidate_id or not symbol:
+            raise ValueError("Trade setup requires account_scope, candidate_id and symbol")
+        if side not in {"Buy", "Sell"}:
+            raise ValueError("Trade setup side must be Buy or Sell")
+        now = _utcnow()
+        plan = dict(plan or {})
+
+        def value(name: str) -> Optional[str]:
+            raw = plan.get(name)
+            return None if raw is None else str(raw)
+
+        with self._lock, self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            unresolved = conn.execute(
+                """
+                SELECT candidate_id
+                FROM trade_setups
+                WHERE account_scope = ? AND symbol = ? AND dry_run = ?
+                  AND candidate_id <> ?
+                  AND status IN (
+                      'planned', 'entry_submitted', 'entry_filled',
+                      'open', 'closing', 'reconcile_required'
+                  )
+                LIMIT 1
+                """,
+                (
+                    account_scope,
+                    symbol.upper(),
+                    int(bool(dry_run)),
+                    candidate_id,
+                ),
+            ).fetchone()
+            if unresolved:
+                conn.execute("ROLLBACK")
+                raise ValueError(
+                    f"Unresolved trade setup already exists for {symbol.upper()}: "
+                    f"{unresolved['candidate_id']}"
+                )
+            conn.execute(
+                """
+                INSERT INTO trade_setups (
+                    account_scope, candidate_id, snapshot_id, strategy_version,
+                    selector_reason, symbol, side, status, dry_run,
+                    entry_order_link_id, planned_qty, planned_entry_price,
+                    planned_take_profit, planned_stop_loss, planned_leverage,
+                    planned_risk_usd, planned_reward_usd, planned_cost_usd,
+                    planned_net_rr, decision_json, snapshot_json,
+                    sizing_context_json, created_at, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?
+                )
+                ON CONFLICT(account_scope, candidate_id) DO UPDATE SET
+                    snapshot_id = COALESCE(excluded.snapshot_id, trade_setups.snapshot_id),
+                    strategy_version = excluded.strategy_version,
+                    selector_reason = COALESCE(
+                        excluded.selector_reason, trade_setups.selector_reason
+                    ),
+                    symbol = excluded.symbol,
+                    side = excluded.side,
+                    status = CASE
+                        WHEN trade_setups.status IN (
+                            'entry_filled', 'open', 'closing', 'closed',
+                            'reconcile_required', 'previewed', 'not_filled',
+                            'failed'
+                        )
+                         AND excluded.status IN ('planned', 'entry_submitted')
+                        THEN trade_setups.status
+                        ELSE excluded.status
+                    END,
+                    dry_run = excluded.dry_run,
+                    entry_order_link_id = COALESCE(
+                        excluded.entry_order_link_id,
+                        trade_setups.entry_order_link_id
+                    ),
+                    planned_qty = COALESCE(
+                        excluded.planned_qty, trade_setups.planned_qty
+                    ),
+                    planned_entry_price = COALESCE(
+                        excluded.planned_entry_price,
+                        trade_setups.planned_entry_price
+                    ),
+                    planned_take_profit = COALESCE(
+                        excluded.planned_take_profit,
+                        trade_setups.planned_take_profit
+                    ),
+                    planned_stop_loss = COALESCE(
+                        excluded.planned_stop_loss,
+                        trade_setups.planned_stop_loss
+                    ),
+                    planned_leverage = COALESCE(
+                        excluded.planned_leverage,
+                        trade_setups.planned_leverage
+                    ),
+                    planned_risk_usd = COALESCE(
+                        excluded.planned_risk_usd,
+                        trade_setups.planned_risk_usd
+                    ),
+                    planned_reward_usd = COALESCE(
+                        excluded.planned_reward_usd,
+                        trade_setups.planned_reward_usd
+                    ),
+                    planned_cost_usd = COALESCE(
+                        excluded.planned_cost_usd,
+                        trade_setups.planned_cost_usd
+                    ),
+                    planned_net_rr = COALESCE(
+                        excluded.planned_net_rr,
+                        trade_setups.planned_net_rr
+                    ),
+                    decision_json = COALESCE(
+                        excluded.decision_json, trade_setups.decision_json
+                    ),
+                    snapshot_json = COALESCE(
+                        excluded.snapshot_json, trade_setups.snapshot_json
+                    ),
+                    sizing_context_json = COALESCE(
+                        excluded.sizing_context_json,
+                        trade_setups.sizing_context_json
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    account_scope,
+                    candidate_id,
+                    snapshot_id,
+                    strategy_version,
+                    selector_reason,
+                    symbol.upper(),
+                    side,
+                    status,
+                    int(bool(dry_run)),
+                    entry_order_link_id,
+                    value("quantity"),
+                    value("entry_price"),
+                    value("take_profit"),
+                    value("stop_loss"),
+                    value("leverage"),
+                    value("risk_usd"),
+                    value("reward_usd"),
+                    value("estimated_cost_usd"),
+                    value("net_risk_reward"),
+                    _json_payload(decision),
+                    _json_payload(snapshot),
+                    _json_payload(sizing_context),
+                    now,
+                    now,
+                ),
+            )
+            conn.execute("COMMIT")
+
+    def update_trade_setup(
+        self,
+        account_scope: str,
+        candidate_id: str,
+        **changes: Any,
+    ) -> None:
+        allowed = {
+            "status",
+            "entry_order_id",
+            "entry_order_link_id",
+            "actual_entry_qty",
+            "actual_entry_price",
+            "opened_at_ms",
+            "closed_at_ms",
+            "last_error",
+        }
+        selected = {
+            key: value
+            for key, value in changes.items()
+            if key in allowed and value is not None
+        }
+        if not selected:
+            return
+        selected["updated_at"] = _utcnow()
+        assignments = ", ".join(f"{column} = ?" for column in selected)
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                f"""
+                UPDATE trade_setups
+                SET {assignments}
+                WHERE account_scope = ? AND candidate_id = ?
+                """,
+                (*selected.values(), account_scope, candidate_id),
+            )
+
+    def _matching_trade_candidate(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        account_scope: str,
+        symbol: str,
+        position_side: Optional[str],
+        avg_entry_price: Optional[str],
+        closed_size: Optional[str],
+        closed_at_ms: int,
+    ) -> Optional[str]:
+        if position_side not in {"Buy", "Sell"}:
+            return None
+        rows = conn.execute(
+            """
+            SELECT candidate_id, actual_entry_price, planned_entry_price,
+                   actual_entry_qty, planned_qty, opened_at_ms
+            FROM trade_setups
+            WHERE account_scope = ? AND symbol = ? AND side = ?
+              AND dry_run = 0
+              AND status IN (
+                  'entry_filled', 'open', 'closing', 'reconcile_required'
+              )
+              AND COALESCE(opened_at_ms, 0) <= ?
+            ORDER BY COALESCE(opened_at_ms, 0) DESC
+            LIMIT 8
+            """,
+            (account_scope, symbol, position_side, closed_at_ms),
+        ).fetchall()
+        if not rows:
+            return None
+        try:
+            observed = Decimal(str(avg_entry_price))
+        except (InvalidOperation, TypeError, ValueError):
+            observed = Decimal("0")
+        try:
+            incoming_size = Decimal(str(closed_size))
+        except (InvalidOperation, TypeError, ValueError):
+            incoming_size = Decimal("0")
+        matching: list[sqlite3.Row] = []
+        for row in rows:
+            reference_raw = row["actual_entry_price"] or row["planned_entry_price"]
+            try:
+                reference = Decimal(str(reference_raw))
+                expected_size = Decimal(
+                    str(row["actual_entry_qty"] or row["planned_qty"])
+                )
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if (
+                reference <= 0
+                or observed <= 0
+                or expected_size <= 0
+                or incoming_size <= 0
+            ):
+                continue
+            if abs(reference - observed) / reference <= Decimal("0.005"):
+                linked_rows = conn.execute(
+                    """
+                    SELECT closed_size
+                    FROM closed_trade_records
+                    WHERE account_scope = ? AND candidate_id = ?
+                    """,
+                    (account_scope, row["candidate_id"]),
+                ).fetchall()
+                try:
+                    already_closed = sum(
+                        (
+                            Decimal(str(linked["closed_size"]))
+                            for linked in linked_rows
+                            if linked["closed_size"] not in (None, "")
+                        ),
+                        Decimal("0"),
+                    )
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+                tolerance = max(
+                    expected_size * Decimal("0.000001"),
+                    Decimal("0.000000000001"),
+                )
+                remaining = expected_size - already_closed
+                if remaining <= tolerance:
+                    continue
+                if incoming_size > remaining + tolerance:
+                    continue
+                matching.append(row)
+        if len(matching) != 1:
+            return None
+        # Do not guess when stale state or external account activity leaves
+        # multiple price-compatible lifecycles.
+        return str(matching[0]["candidate_id"])
+
+    def upsert_closed_trade_record(
+        self,
+        account_scope: str,
+        record: dict[str, Any],
+    ) -> bool:
+        """Idempotently persist one normalized Bybit Closed PnL record."""
+        required = {
+            "record_id",
+            "symbol",
+            "closed_pnl",
+            "created_time_ms",
+            "updated_time_ms",
+            "raw_json",
+        }
+        if any(record.get(name) is None for name in required):
+            raise ValueError("Normalized closed trade record is incomplete")
+        now = _utcnow()
+        with self._lock, self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT candidate_id
+                FROM closed_trade_records
+                WHERE account_scope = ? AND record_id = ?
+                """,
+                (account_scope, record["record_id"]),
+            ).fetchone()
+            candidate_id = (
+                str(existing["candidate_id"])
+                if existing and existing["candidate_id"]
+                else self._matching_trade_candidate(
+                    conn,
+                    account_scope=account_scope,
+                    symbol=str(record["symbol"]),
+                    position_side=record.get("position_side"),
+                    avg_entry_price=record.get("avg_entry_price"),
+                    closed_size=record.get("closed_size"),
+                    closed_at_ms=int(record["updated_time_ms"]),
+                )
+            )
+            conn.execute(
+                """
+                INSERT INTO closed_trade_records (
+                    account_scope, record_id, order_id, candidate_id, symbol,
+                    close_side, position_side, order_type, exec_type, qty,
+                    closed_size, order_price, avg_entry_price, avg_exit_price,
+                    cum_entry_value, cum_exit_value, closed_pnl, open_fee,
+                    close_fee, fee_data_complete, leverage, fill_count,
+                    created_time_ms, updated_time_ms, raw_json, synced_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?
+                )
+                ON CONFLICT(account_scope, record_id) DO UPDATE SET
+                    order_id = COALESCE(
+                        excluded.order_id,
+                        closed_trade_records.order_id
+                    ),
+                    candidate_id = COALESCE(
+                        closed_trade_records.candidate_id,
+                        excluded.candidate_id
+                    ),
+                    symbol = excluded.symbol,
+                    close_side = COALESCE(
+                        excluded.close_side,
+                        closed_trade_records.close_side
+                    ),
+                    position_side = COALESCE(
+                        excluded.position_side,
+                        closed_trade_records.position_side
+                    ),
+                    order_type = COALESCE(
+                        excluded.order_type,
+                        closed_trade_records.order_type
+                    ),
+                    exec_type = COALESCE(
+                        excluded.exec_type,
+                        closed_trade_records.exec_type
+                    ),
+                    qty = COALESCE(excluded.qty, closed_trade_records.qty),
+                    closed_size = COALESCE(
+                        excluded.closed_size,
+                        closed_trade_records.closed_size
+                    ),
+                    order_price = COALESCE(
+                        excluded.order_price,
+                        closed_trade_records.order_price
+                    ),
+                    avg_entry_price = COALESCE(
+                        excluded.avg_entry_price,
+                        closed_trade_records.avg_entry_price
+                    ),
+                    avg_exit_price = COALESCE(
+                        excluded.avg_exit_price,
+                        closed_trade_records.avg_exit_price
+                    ),
+                    cum_entry_value = COALESCE(
+                        excluded.cum_entry_value,
+                        closed_trade_records.cum_entry_value
+                    ),
+                    cum_exit_value = COALESCE(
+                        excluded.cum_exit_value,
+                        closed_trade_records.cum_exit_value
+                    ),
+                    closed_pnl = excluded.closed_pnl,
+                    open_fee = COALESCE(
+                        excluded.open_fee,
+                        closed_trade_records.open_fee
+                    ),
+                    close_fee = COALESCE(
+                        excluded.close_fee,
+                        closed_trade_records.close_fee
+                    ),
+                    fee_data_complete = MAX(
+                        closed_trade_records.fee_data_complete,
+                        excluded.fee_data_complete
+                    ),
+                    leverage = COALESCE(
+                        excluded.leverage,
+                        closed_trade_records.leverage
+                    ),
+                    fill_count = COALESCE(
+                        excluded.fill_count,
+                        closed_trade_records.fill_count
+                    ),
+                    created_time_ms = MIN(
+                        closed_trade_records.created_time_ms,
+                        excluded.created_time_ms
+                    ),
+                    updated_time_ms = excluded.updated_time_ms,
+                    raw_json = excluded.raw_json,
+                    synced_at = excluded.synced_at
+                WHERE excluded.updated_time_ms >=
+                      closed_trade_records.updated_time_ms
+                """,
+                (
+                    account_scope,
+                    record["record_id"],
+                    record.get("order_id"),
+                    candidate_id,
+                    str(record["symbol"]).upper(),
+                    record.get("close_side"),
+                    record.get("position_side"),
+                    record.get("order_type"),
+                    record.get("exec_type"),
+                    record.get("qty"),
+                    record.get("closed_size"),
+                    record.get("order_price"),
+                    record.get("avg_entry_price"),
+                    record.get("avg_exit_price"),
+                    record.get("cum_entry_value"),
+                    record.get("cum_exit_value"),
+                    record["closed_pnl"],
+                    record.get("open_fee"),
+                    record.get("close_fee"),
+                    int(bool(record.get("fee_data_complete"))),
+                    record.get("leverage"),
+                    record.get("fill_count"),
+                    int(record["created_time_ms"]),
+                    int(record["updated_time_ms"]),
+                    record["raw_json"],
+                    now,
+                ),
+            )
+            persisted = conn.execute(
+                """
+                SELECT candidate_id
+                FROM closed_trade_records
+                WHERE account_scope = ? AND record_id = ?
+                """,
+                (account_scope, record["record_id"]),
+            ).fetchone()
+            persisted_candidate = (
+                str(persisted["candidate_id"])
+                if persisted and persisted["candidate_id"]
+                else None
+            )
+            if persisted_candidate:
+                setup = conn.execute(
+                    """
+                    SELECT actual_entry_qty, planned_qty
+                    FROM trade_setups
+                    WHERE account_scope = ? AND candidate_id = ?
+                    """,
+                    (account_scope, persisted_candidate),
+                ).fetchone()
+                size_rows = conn.execute(
+                    """
+                    SELECT closed_size, updated_time_ms
+                    FROM closed_trade_records
+                    WHERE account_scope = ? AND candidate_id = ?
+                    """,
+                    (account_scope, persisted_candidate),
+                ).fetchall()
+                try:
+                    expected_size = Decimal(
+                        str(
+                            (
+                                setup["actual_entry_qty"]
+                                or setup["planned_qty"]
+                            )
+                            if setup
+                            else ""
+                        )
+                    )
+                    closed_size = sum(
+                        (
+                            Decimal(str(row["closed_size"]))
+                            for row in size_rows
+                            if row["closed_size"] not in (None, "")
+                        ),
+                        Decimal("0"),
+                    )
+                except (InvalidOperation, TypeError, ValueError):
+                    expected_size = Decimal("0")
+                    closed_size = Decimal("0")
+                tolerance = max(
+                    expected_size * Decimal("0.000001"),
+                    Decimal("0.000000000001"),
+                )
+                if (
+                    expected_size > 0
+                    and closed_size + tolerance >= expected_size
+                ):
+                    closed_at_ms = max(
+                        int(row["updated_time_ms"]) for row in size_rows
+                    )
+                    conn.execute(
+                        """
+                        UPDATE trade_setups
+                        SET status = 'closed',
+                            closed_at_ms = CASE
+                                WHEN closed_at_ms IS NULL OR closed_at_ms < ?
+                                THEN ? ELSE closed_at_ms
+                            END,
+                            updated_at = ?
+                        WHERE account_scope = ? AND candidate_id = ?
+                        """,
+                        (
+                            closed_at_ms,
+                            closed_at_ms,
+                            now,
+                            account_scope,
+                            persisted_candidate,
+                        ),
+                    )
+            conn.execute("COMMIT")
+        return existing is None
+
+    def list_closed_trade_records(
+        self,
+        account_scope: str,
+        *,
+        since_ms: int,
+        bot_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        bot_clause = "AND c.candidate_id IS NOT NULL" if bot_only else ""
+        with self._lock, self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT c.*,
+                       s.side AS setup_side,
+                       s.planned_risk_usd,
+                       s.planned_reward_usd,
+                       s.planned_entry_price,
+                       s.planned_take_profit,
+                       s.planned_stop_loss,
+                       s.opened_at_ms AS setup_opened_at_ms
+                FROM closed_trade_records c
+                LEFT JOIN trade_setups s
+                  ON s.account_scope = c.account_scope
+                 AND s.candidate_id = c.candidate_id
+                WHERE c.account_scope = ?
+                  AND c.updated_time_ms >= ?
+                  {bot_clause}
+                ORDER BY c.updated_time_ms ASC,
+                         c.created_time_ms ASC,
+                         c.record_id ASC
+                """,
+                (account_scope, int(since_ms)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_trade_sync_state(
+        self,
+        account_scope: str,
+        source: str = "closed_pnl",
+    ) -> dict[str, Any]:
+        with self._lock, self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM trade_sync_state
+                WHERE account_scope = ? AND source = ?
+                """,
+                (account_scope, source),
+            ).fetchone()
+        return dict(row) if row else {}
+
+    def update_trade_sync_state(
+        self,
+        account_scope: str,
+        *,
+        coverage_start_ms: int,
+        coverage_end_ms: int,
+        last_success_ms: int,
+        source: str = "closed_pnl",
+    ) -> None:
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO trade_sync_state (
+                    account_scope, source, coverage_start_ms, coverage_end_ms,
+                    last_success_ms, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_scope, source) DO UPDATE SET
+                    coverage_start_ms = MIN(
+                        trade_sync_state.coverage_start_ms,
+                        excluded.coverage_start_ms
+                    ),
+                    coverage_end_ms = MAX(
+                        trade_sync_state.coverage_end_ms,
+                        excluded.coverage_end_ms
+                    ),
+                    last_success_ms = MAX(
+                        trade_sync_state.last_success_ms,
+                        excluded.last_success_ms
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    account_scope,
+                    source,
+                    int(coverage_start_ms),
+                    int(coverage_end_ms),
+                    int(last_success_ms),
+                    _utcnow(),
+                ),
+            )
+
+    def record_equity_snapshot(
+        self,
+        account_scope: str,
+        *,
+        captured_at_ms: int,
+        equity_usd: Any,
+        wallet_balance_usd: Any = None,
+        available_usd: Any = None,
+        unrealized_pnl_usd: Any = None,
+        source: str = "runtime",
+        bucket_seconds: int = 3_600,
+    ) -> None:
+        scope = str(account_scope).strip()
+        if not scope:
+            raise ValueError("Equity snapshot requires account_scope")
+        captured = int(captured_at_ms)
+        if captured <= 0:
+            raise ValueError("Equity snapshot timestamp must be positive")
+        bucket_ms = max(60, int(bucket_seconds)) * 1_000
+        bucket_time = captured // bucket_ms * bucket_ms
+
+        def text(value: Any, *, required: bool = False) -> Optional[str]:
+            if value is None or value == "":
+                if required:
+                    raise ValueError("Equity snapshot requires equity_usd")
+                return None
+            try:
+                number = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError) as error:
+                raise ValueError("Equity snapshot contains invalid decimal") from error
+            if not number.is_finite():
+                raise ValueError("Equity snapshot contains non-finite decimal")
+            if required and number <= 0:
+                raise ValueError("Equity snapshot equity_usd must be positive")
+            return format(number, "f")
+
+        equity_text = text(equity_usd, required=True)
+        wallet_text = text(wallet_balance_usd)
+        available_text = text(available_usd)
+        unrealized_text = text(unrealized_pnl_usd)
+
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO equity_snapshots (
+                    account_scope, bucket_time_ms, captured_at_ms, equity_usd,
+                    wallet_balance_usd, available_usd, unrealized_pnl_usd,
+                    source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_scope, bucket_time_ms) DO UPDATE SET
+                    captured_at_ms = excluded.captured_at_ms,
+                    equity_usd = excluded.equity_usd,
+                    wallet_balance_usd = COALESCE(
+                        excluded.wallet_balance_usd,
+                        equity_snapshots.wallet_balance_usd
+                    ),
+                    available_usd = COALESCE(
+                        excluded.available_usd,
+                        equity_snapshots.available_usd
+                    ),
+                    unrealized_pnl_usd = COALESCE(
+                        excluded.unrealized_pnl_usd,
+                        equity_snapshots.unrealized_pnl_usd
+                    ),
+                    source = excluded.source
+                WHERE excluded.captured_at_ms >=
+                      equity_snapshots.captured_at_ms
+                """,
+                (
+                    scope,
+                    bucket_time,
+                    captured,
+                    equity_text,
+                    wallet_text,
+                    available_text,
+                    unrealized_text,
+                    source,
+                ),
+            )
+            cutoff = captured - 730 * 24 * 60 * 60 * 1_000
+            conn.execute(
+                """
+                DELETE FROM equity_snapshots
+                WHERE account_scope = ? AND captured_at_ms < ?
+                """,
+                (scope, cutoff),
+            )
+
+    def list_equity_snapshots(
+        self,
+        account_scope: str,
+        *,
+        since_ms: int,
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT captured_at_ms, equity_usd, wallet_balance_usd,
+                       available_usd, unrealized_pnl_usd, source
+                FROM equity_snapshots
+                WHERE account_scope = ? AND captured_at_ms >= ?
+                ORDER BY captured_at_ms ASC
+                """,
+                (account_scope, int(since_ms)),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def update_daily_equity_guard(
         self,
