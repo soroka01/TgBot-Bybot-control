@@ -49,7 +49,7 @@ if not exist ".env" (
     goto :failed
 )
 
-"%PYTHON_CMD%" -c "import aiogram, dotenv, loguru, numpy, openai, requests" >nul 2>&1
+"%PYTHON_CMD%" -c "import aiogram, dotenv, loguru, matplotlib, numpy, openai, requests; from aiogram.types import InputRichMessage; from importlib.metadata import version; from packaging.version import Version; aiogram_version = Version(version('aiogram')); matplotlib_version = Version(version('matplotlib')); assert Version('3.30.0') <= aiogram_version < Version('4'); assert Version('3.10.8') <= matplotlib_version < Version('4')" >nul 2>&1
 if errorlevel 1 (
     echo [SETUP] Installing dependencies into .venv...
     "%PYTHON_CMD%" -m pip install -r requirements.txt

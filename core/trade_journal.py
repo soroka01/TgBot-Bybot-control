@@ -19,7 +19,6 @@ from typing import Any, Iterable, Optional
 
 from api.bybit_api import BybitAPI
 from storage.database import SQLiteStore, get_store
-from utils.helpers import parse_account_overview
 from utils.logger_setup import logger
 
 
@@ -92,6 +91,115 @@ def _decimal_text(value: Any, *, required: bool = False) -> Optional[str]:
     if not number.is_finite():
         raise ValueError("Closed PnL содержит нечисловое значение")
     return format(number, "f")
+
+
+def _equity_number(
+    container: dict[str, Any],
+    field: str,
+    *,
+    required: bool = False,
+) -> Optional[Decimal]:
+    """Parse one wallet field without treating documented empty values as zero."""
+    raw = container.get(field)
+    if raw is None or raw == "":
+        if required:
+            raise ValueError(f"Bybit не вернул обязательное поле {field}")
+        return None
+    if isinstance(raw, bool):
+        raise ValueError(f"Bybit вернул некорректное поле {field}")
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError(f"Bybit вернул некорректное поле {field}") from error
+    if not value.is_finite():
+        raise ValueError(f"Bybit вернул некорректное поле {field}")
+    return value
+
+
+def _history_equity_overview(wallet_response: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Return the fields needed by analytics for every supported UTA margin mode.
+
+    Bybit intentionally leaves some account-wide fields empty in UTA isolated
+    margin.  Trading still uses its strict account parser; only this optional
+    analytics snapshot accepts those documented omissions.
+    """
+    if not isinstance(wallet_response, dict):
+        raise ValueError("Bybit вернул повреждённый ответ баланса аккаунта")
+    result = wallet_response.get("result")
+    rows = result.get("list") if isinstance(result, dict) else None
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        raise ValueError("Bybit не вернул баланс аккаунта")
+    account = rows[0]
+
+    equity = _equity_number(account, "totalEquity")
+    if equity is None:
+        coins = account.get("coin")
+        if not isinstance(coins, list):
+            raise ValueError("Bybit вернул повреждённый список активов аккаунта")
+        equity = Decimal("0")
+        for index, coin in enumerate(coins):
+            if not isinstance(coin, dict):
+                raise ValueError(
+                    f"Bybit вернул повреждённый актив account.coin[{index}]"
+                )
+            usd_value = _equity_number(coin, "usdValue")
+            if usd_value is not None:
+                equity += usd_value
+    if equity == 0:
+        return None
+    if equity < 0:
+        raise ValueError("Bybit вернул отрицательный equity аккаунта")
+
+    wallet_balance = _equity_number(account, "totalWalletBalance")
+    unrealized_pnl = _equity_number(account, "totalPerpUPL")
+    available = _equity_number(account, "totalAvailableBalance")
+
+    # Account-wide available balance is not applicable to isolated margin.
+    # Use Bybit's documented per-coin derivatives formula when all operands
+    # are present; otherwise leave this optional metric unknown.
+    if available is None:
+        coins = account.get("coin")
+        if coins is not None and not isinstance(coins, list):
+            raise ValueError("Bybit вернул повреждённый список активов аккаунта")
+        usdt = next(
+            (
+                coin
+                for coin in (coins or [])
+                if isinstance(coin, dict) and coin.get("coin") == "USDT"
+            ),
+            None,
+        )
+        if usdt is not None:
+            operands = [
+                _equity_number(usdt, field)
+                for field in (
+                    "walletBalance",
+                    "totalPositionIM",
+                    "totalOrderIM",
+                    "locked",
+                    "bonus",
+                )
+            ]
+            if all(value is not None for value in operands):
+                wallet, position_im, order_im, locked, bonus = operands
+                assert (
+                    wallet is not None
+                    and position_im is not None
+                    and order_im is not None
+                    and locked is not None
+                    and bonus is not None
+                )
+                available = max(
+                    Decimal("0"),
+                    wallet - position_im - order_im - locked - bonus,
+                )
+
+    return {
+        "equity_usd": equity,
+        "balance_usd": wallet_balance,
+        "available_usd": available,
+        "unrealized_pnl_usd": unrealized_pnl,
+    }
 
 
 def _positive_milliseconds(value: Any, fallback: Any = None) -> int:
@@ -439,12 +547,12 @@ class TradeJournal:
             source=source,
         )
 
-    def record_current_equity(self) -> None:
-        account = parse_account_overview(
-            self.bybit.get_wallet_balance(),
-            strict=True,
-        )
+    def record_current_equity(self) -> bool:
+        account = _history_equity_overview(self.bybit.get_wallet_balance())
+        if account is None:
+            return False
         self.record_equity(account, source="history_sync")
+        return True
 
     def import_closed_pnl_rows(
         self,

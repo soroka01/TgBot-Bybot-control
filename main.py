@@ -17,7 +17,7 @@ def print_banner():
     banner = """
     ╔══════════════════════════════════════════════════════════╗
     ║                                                          ║
-    ║          🤖 CRYPTO TRADING BOT FOR BYBIT 🤖             ║
+    ║          🤖 CRYPTO TRADING BOT FOR BYBIT 🤖              ║
     ║                                                          ║
     ║          Powered by DeepSeek AI & Aiogram                ║
     ║                                                          ║

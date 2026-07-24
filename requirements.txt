@@ -5,7 +5,8 @@ python-dotenv>=1.0.0,<2
 
 # Market calculations and logs
 numpy>=1.24.0,<3
+matplotlib>=3.10.8,<4
 loguru>=0.7.0,<1
 
 # Telegram
-aiogram>=3.7.0,<4
+aiogram>=3.30.0,<4

@@ -1,4 +1,4 @@
-"""Live text chart screen."""
+"""Live Bybit chart rendered inside the canonical Telegram message."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from api.bybit_api import BybitAPI
 from config import TRADABLE_TOKENS
-from core.chart import build_chart_text
+from core.chart import RICH_MEDIA_ID, build_chart_payload
 from storage.database import get_store
-from telegram_bot.ui import render_live_screen
+from telegram_bot.ui import RichPhotoScreen, render_rich_live_screen
 
 router = Router()
 INTERVALS = ("5", "15", "60", "240")
@@ -55,8 +55,19 @@ def build_chart_view(chat_id: int):
         interval = "15"
     bybit = BybitAPI()
     try:
-        text = build_chart_text(bybit, f"{symbol}USDT", interval)
-        return text, chart_markup(symbol, interval)
+        market_symbol = f"{symbol}USDT"
+        payload = build_chart_payload(bybit, market_symbol, interval)
+        markup = chart_markup(symbol, interval)
+        if payload.png is None:
+            return payload.fallback_text, markup
+        screen = RichPhotoScreen(
+            html=payload.rich_html,
+            photo=payload.png,
+            fallback_text=payload.fallback_text,
+            filename=f"chart-{market_symbol}-{interval}.png",
+            media_id=RICH_MEDIA_ID,
+        )
+        return screen, markup
     finally:
         bybit.close()
 
@@ -67,7 +78,11 @@ async def show_chart(callback: CallbackQuery) -> None:
     async def loader():
         return await asyncio.to_thread(build_chart_view, chat_id)
 
-    await render_live_screen(callback.message, loader, interval_seconds=15)
+    await render_rich_live_screen(
+        callback.message,
+        loader,
+        interval_seconds=30,
+    )
 
 
 @router.callback_query(F.data == "menu:chart")

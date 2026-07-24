@@ -1,11 +1,11 @@
 # 🤖 Crypto Trading Bot for Bybit
 
-> Одно сообщение в Telegram для контроля Bybit Unified Account: позиции, история и статистика сделок, живой текстовый график, алерты, безопасный AI-отбор сетапов и опциональное автоисполнение.
+> Одно сообщение в Telegram для контроля Bybit Unified Account: позиции, история и статистика сделок, живой свечной график, алерты, безопасный AI-отбор сетапов и опциональное автоисполнение.
 
 🌐 **Язык:** [Русский](README.md) · [English](README_EN.md)
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0?logo=telegram&logoColor=white)
+![Aiogram](https://img.shields.io/badge/aiogram-3.30%2B-2CA5E0?logo=telegram&logoColor=white)
 ![Bybit](https://img.shields.io/badge/Bybit-V5-F7A600)
 ![License](https://img.shields.io/badge/License-MIT-2EA44F)
 
@@ -36,14 +36,9 @@
 - Auto-событие показывается компактным banner поверх текущего экрана и не уничтожает открытый route.
 - После рестарта сохранённый экран переводится в честное состояние «бот перезапущен».
 
-Настоящий PNG-график намеренно не используется. Telegram позволяет перейти из text message в media message, но обратный переход неудобен, а caption ограничен 1024 символами. Поэтому экраны рынка и сделок показывают доступные быстрые sparklines из закрытых свечей и накопленного PnL:
+Живой график — PNG, встроенный в Telegram rich message: это не отдельная media-запись и не новый message. Поэтому меню, график и обычные текстовые экраны заменяют друг друга через `editMessageText` с тем же `message_id`, а лимит media-caption не применяется. Если график временно не построен, остаётся доступный текстовый fallback.
 
-```text
-BTCUSDT · 15м
-$117 420  +1.82% за 32 свечи
-▁▂▃▃▄▅▅▆▇▆▇█
-L 114.8k · EMA20 116.9k · H 118.2k
-```
+График строится локально через Matplotlib Agg по точным закрытым свечам Bybit: candles, EMA20/EMA50, объём и текущая цена. Минимум за 14 дней берётся отдельно из 14 закрытых дневных свечей. Далёкий уровень подписывается как находящийся вне масштаба и не сжимает видимые свечи.
 
 ### AI — селектор, а не исполнитель
 
@@ -94,7 +89,7 @@ L 114.8k · EMA20 116.9k · H 118.2k
 | --- | --- | --- |
 | 📊 Позиции | Позиции, PnL, ROI, TP/SL, подтверждённое закрытие | 8с |
 | 💰 Баланс | Wallet, equity, margin, available balance | 10с |
-| 📈 Живой график | Sparkline, H/L, EMA20/50, RSI, ATR, spread | 15с |
+| 📈 Живой график | Свечи, EMA20/50, объём, live price и 14D low | 30с |
 | 🔍 Рынок | Цена, 24h change, режим, RSI и spread | 15с |
 | 🧠 AI-сетапы | Read-only выбор и полный deterministic trade plan | По запросу |
 | 🤖 Авто | Lifecycle, режим, лимиты, последний цикл и ошибка | 5с |
@@ -113,6 +108,7 @@ L 114.8k · EMA20 116.9k · H 118.2k
 - В audit-layer рассчитываются net/gross PnL, W/L/BE, win rate, profit factor, expectancy, median, средняя прибыль/потеря, payoff, drawdown/recovery, серии, комиссии, оборот, удержание, R/SQN, Long/Short и статистика инструментов. Telegram оставляет компактный срез и последние пять сделок; метрика появляется только при достаточных данных.
 - В SQLite остаются исходная запись Bybit, точный локальный план, snapshot, решение селектора и sizing context. Это позволяет позднее аудитировать результат без перегрузки Telegram-экрана.
 - Изменение equity и account-level drawdown в процентах строятся только по накопленным equity snapshots. Они не корректируются на ввод/вывод средств, поэтому для оценки стратегии основным остаётся Closed PnL. Sharpe/Sortino намеренно не показываются без достаточной корректной дневной equity-кривой.
+- Для UTA 2.0 isolated margin документированно пустые account-wide margin/available fields не считаются ошибкой equity-snapshot: optional available вычисляется из USDT coin fields, а нулевой equity спокойно пропускается. Строгая проверка торгового контура при этом не ослабляется.
 
 ## Архитектура
 
@@ -142,16 +138,15 @@ core/
   decision_engine.py    snapshot, candidates, strict AI schema
   risk_engine.py        Decimal sizing, costs, gates, portfolio risk
   market_data.py        closed candles and technical features
-  chart.py              text sparkline
+  chart.py              closed-candle PNG, EMA/volume/14D low and text fallback
   trade_journal.py       account-scoped Closed PnL sync and entry audit trail
   trade_analytics.py     Decimal performance metrics and partial-close grouping
   auto_trading.py       cycle and serialized side effects
   alerts.py             crossing logic
 storage/database.py     SQLite repository, trade history, equity and outbox
-telegram_bot/ui.py      one-message state, locks, revisions and live tasks
+telegram_bot/ui.py      one-message text/rich state, locks, revisions and live tasks
 telegram_bot/handlers/
   history.py            compact period/scope performance screen
-tests/                  network-free safety tests
 ```
 
 ## Установка
@@ -240,14 +235,12 @@ python main.py
 ## Проверка
 
 ```powershell
-python -m unittest discover -s tests -v
-python -m compileall -q main.py config.py api core storage telegram_bot tests utils
+python -m compileall -q main.py config.py api core storage telegram_bot utils
+python -m pip check
 git diff --check
 ```
 
-Тесты покрывают HMAC, malformed API responses, запрет blind POST retry, reconciliation и partial fills, paired TP/SL, динамическую precision, строгий AI contract, stale snapshot, closed candles, journal-before-entry, идемпотентный 7-дневный backfill, Decimal-метрики, sparkline, risk sizing, portfolio/daily guards, durable outbox и single-message UI.
-
-Для интеграционной проверки используйте Bybit Demo/Testnet. Автотесты репозитория не отправляют ордера.
+Для интеграционной проверки используйте Bybit Demo/Testnet. Команды проверки выше не отправляют ордера.
 
 ## Runtime и приватность
 

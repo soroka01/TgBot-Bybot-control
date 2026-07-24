@@ -12,6 +12,7 @@ import hashlib
 import html
 import re
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional, Tuple
 
 from aiogram import BaseMiddleware, Bot
@@ -25,8 +26,12 @@ from aiogram.exceptions import (
     TelegramServerError,
 )
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputRichMessage,
+    InputRichMessageMedia,
     Message,
     TelegramObject,
     Update,
@@ -39,11 +44,66 @@ from utils.logger_setup import logger
 ScreenContent = Tuple[str, Optional[InlineKeyboardMarkup]]
 ScreenLoader = Callable[[], Awaitable[ScreenContent]]
 
+
+@dataclass(frozen=True)
+class RichPhotoScreen:
+    """One editable Telegram rich message with an uploaded in-message photo."""
+
+    html: str
+    photo: bytes
+    fallback_text: str
+    filename: str = "chart.png"
+    media_id: str = "market_chart"
+
+    def __post_init__(self) -> None:
+        if not self.html or len(self.html) > 30_000:
+            raise ValueError("Rich screen HTML has an invalid size")
+        if not self.photo or len(self.photo) > 8 * 1024 * 1024:
+            raise ValueError("Rich screen photo has an invalid size")
+        if not self.fallback_text:
+            raise ValueError("Rich screen requires an accessible text fallback")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.media_id):
+            raise ValueError("Rich screen media_id is invalid")
+        if f"tg://photo?id={self.media_id}" not in self.html:
+            raise ValueError("Rich screen HTML does not reference its photo")
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", self.filename)
+            or not self.filename.lower().endswith(".png")
+        ):
+            raise ValueError("Rich screen filename is invalid")
+
+    def telegram_content(self, *, html_text: Optional[str] = None) -> InputRichMessage:
+        return InputRichMessage(
+            html=html_text if html_text is not None else self.html,
+            media=[
+                InputRichMessageMedia(
+                    id=self.media_id,
+                    media=InputMediaPhoto(
+                        media=BufferedInputFile(
+                            self.photo,
+                            filename=self.filename,
+                        )
+                    ),
+                )
+            ],
+            skip_entity_detection=True,
+        )
+
+
+RichScreenBody = RichPhotoScreen | str
+RichScreenContent = Tuple[RichScreenBody, Optional[InlineKeyboardMarkup]]
+RichScreenLoader = Callable[[], Awaitable[RichScreenContent]]
+
 _screen_messages: dict[int, int] = {}
 _screen_revisions: dict[int, int] = {}
 _screen_callbacks: dict[int, set[str]] = {}
 _screen_fingerprints: dict[int, str] = {}
 _screen_views: dict[int, ScreenContent] = {}
+_screen_rich_views: dict[
+    int,
+    Tuple[RichPhotoScreen, Optional[InlineKeyboardMarkup]],
+] = {}
+_rich_disabled_revisions: dict[int, int] = {}
 _screen_locks: dict[int, asyncio.Lock] = {}
 _live_tasks: dict[int, asyncio.Task] = {}
 _event_banners: dict[int, list[tuple[str, str]]] = {}
@@ -148,6 +208,60 @@ def _fingerprint(text: str, markup: Optional[InlineKeyboardMarkup]) -> str:
     return hashlib.sha256(f"{text}\0{markup_json}".encode("utf-8")).hexdigest()
 
 
+def _rich_fingerprint(
+    screen: RichPhotoScreen,
+    html_text: str,
+    markup: Optional[InlineKeyboardMarkup],
+) -> str:
+    markup_json = markup.model_dump_json(exclude_none=True) if markup else ""
+    digest = hashlib.sha256()
+    digest.update(html_text.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(screen.photo)
+    digest.update(b"\0")
+    digest.update(markup_json.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _rich_fallback_text(body: RichScreenBody) -> str:
+    text = body.fallback_text if isinstance(body, RichPhotoScreen) else body
+    if not text:
+        raise ValueError("Rich live screen requires non-empty fallback text")
+    return text
+
+
+def _rich_is_disabled(
+    chat_id: int,
+    revision: Optional[int] = None,
+) -> bool:
+    target_revision = (
+        _screen_revisions.get(chat_id, 0)
+        if revision is None
+        else revision
+    )
+    return (
+        _rich_disabled_revisions.get(chat_id)
+        == target_revision
+    )
+
+
+def _disable_rich_for_revision(chat_id: int, revision: int) -> bool:
+    if _screen_revisions.get(chat_id, 0) != revision:
+        return False
+    _rich_disabled_revisions[chat_id] = revision
+    return True
+
+
+def _restore_event_banners(
+    chat_id: int,
+    banners: list[tuple[str, str]],
+) -> None:
+    if banners:
+        _event_banners[chat_id] = banners
+    else:
+        _event_banners.pop(chat_id, None)
+
+
 def _compose_with_banners(
     text: str,
     banners: Optional[list[tuple[str, str]]],
@@ -197,6 +311,8 @@ async def unregister_bot() -> None:
     _screen_callbacks.clear()
     _screen_fingerprints.clear()
     _screen_views.clear()
+    _screen_rich_views.clear()
+    _rich_disabled_revisions.clear()
     _screen_locks.clear()
     _event_banners.clear()
     _pending_events.clear()
@@ -241,6 +357,8 @@ async def _deactivate_target(chat_id: int) -> None:
     _screen_callbacks.pop(chat_id, None)
     _screen_fingerprints.pop(chat_id, None)
     _screen_views.pop(chat_id, None)
+    _screen_rich_views.pop(chat_id, None)
+    _rich_disabled_revisions.pop(chat_id, None)
     _event_banners.pop(chat_id, None)
     try:
         from storage.database import get_store
@@ -254,6 +372,7 @@ def restore_screen_targets(targets: list[tuple[int, int, int]]) -> None:
     for chat_id, message_id, revision in targets:
         _screen_messages[chat_id] = message_id
         _screen_revisions[chat_id] = revision
+        _rich_disabled_revisions.pop(chat_id, None)
 
 
 async def refresh_restored_screens() -> None:
@@ -270,18 +389,20 @@ async def refresh_restored_screens() -> None:
     markup = get_main_menu()
     for chat_id, message_id in list(_screen_messages.items()):
         _screen_views[chat_id] = (text, markup)
+        _screen_rich_views.pop(chat_id, None)
         # Revoke every pre-restart keyboard before attempting the network
         # edit.  If Telegram is temporarily unavailable, an old destructive
         # callback must still be rejected locally.
         _screen_callbacks[chat_id] = _callback_values(markup)
         result = await _telegram_edit(_bot, chat_id, message_id, text, markup)
-        if result == "permanent_failure":
+        if result in {"missing", "permanent_failure"}:
             await _deactivate_target(chat_id)
 
 
 def _advance_revision(chat_id: int) -> int:
     revision = _screen_revisions.get(chat_id, 0) + 1
     _screen_revisions[chat_id] = revision
+    _rich_disabled_revisions.pop(chat_id, None)
     return revision
 
 
@@ -324,6 +445,65 @@ async def stop_live_updates(chat_id: int) -> None:
         await asyncio.gather(task, return_exceptions=True)
 
 
+async def _await_telegram_mutation(
+    mutation: Awaitable,
+    *,
+    propagate_cancel: bool = True,
+):
+    """Let an already-started Telegram edit settle before propagating cancel.
+
+    Cancelling the local HTTP await cannot recall a request that Telegram may
+    already be processing.  Waiting for that request while the per-chat lock
+    remains held guarantees that a newer route edit is sent afterwards.
+    """
+    task = asyncio.ensure_future(mutation)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancelled:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Shutdown or navigation may cancel the outer task more than
+                # once; the Telegram mutation itself must still settle.
+                continue
+        try:
+            result = task.result()
+        except BaseException:
+            # The caller is already being cancelled.  Consume the mutation's
+            # outcome so it cannot become an unobserved task exception.
+            if propagate_cancel:
+                raise cancelled
+            raise
+        if propagate_cancel:
+            raise cancelled
+        # A send must be recorded as canonical after Telegram accepted it;
+        # swallowing cancellation for this short commit path prevents an
+        # orphan response and a duplicate replacement on the next update.
+        return result
+
+
+def _is_media_only_forbidden(error: TelegramForbiddenError) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "chat_send_photos_forbidden",
+            "not allowed to send photo",
+            "not allowed to send media",
+            "not enough rights to send photo",
+            "not enough rights to send media",
+            "can't send photo",
+            "can not send photo",
+            "photo messages are forbidden",
+            "media messages are forbidden",
+            "send photos is forbidden",
+            "sending photos is forbidden",
+            "sending media is forbidden",
+        )
+    )
+
+
 async def _telegram_edit(
     bot: Bot,
     chat_id: int,
@@ -333,19 +513,21 @@ async def _telegram_edit(
     *,
     verify_exists: bool = False,
 ) -> str:
-    """Return ``ok``, ``missing`` or ``temporary_failure``."""
+    """Edit text and return a classified delivery outcome."""
     safe = _safe_text(text)
     fingerprint = _fingerprint(safe, reply_markup)
     if not verify_exists and _screen_fingerprints.get(chat_id) == fingerprint:
         return "ok"
     for attempt in range(2):
         try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=safe,
-                reply_markup=reply_markup,
-                parse_mode="HTML",
+            await _await_telegram_mutation(
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=safe,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML",
+                )
             )
             _screen_fingerprints[chat_id] = fingerprint
             _screen_callbacks[chat_id] = _callback_values(reply_markup)
@@ -369,11 +551,18 @@ async def _telegram_edit(
                 marker in message
                 for marker in (
                     "message to edit not found",
-                    "message can't be edited",
                     "message_id_invalid",
                 )
             ):
                 return "missing"
+            if any(
+                marker in message
+                for marker in (
+                    "message can't be edited",
+                    "message can not be edited",
+                )
+            ):
+                return "uneditable"
             logger.warning(f"Telegram отклонил edit {chat_id}/{message_id}: {error}")
             return "temporary_failure"
         except (TelegramNetworkError, TelegramServerError) as error:
@@ -385,6 +574,159 @@ async def _telegram_edit(
             logger.warning(f"Ошибка Telegram edit {chat_id}/{message_id}: {error}")
             return "temporary_failure"
     return "temporary_failure"
+
+
+async def _telegram_edit_rich(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    screen: RichPhotoScreen,
+    reply_markup: Optional[InlineKeyboardMarkup],
+    *,
+    banners: Optional[list[tuple[str, str]]] = None,
+    verify_exists: bool = False,
+) -> str:
+    """Edit the canonical message as rich content without changing its id."""
+    html_text = _compose_with_banners(screen.html, banners)
+    fingerprint = _rich_fingerprint(screen, html_text, reply_markup)
+    if not verify_exists and _screen_fingerprints.get(chat_id) == fingerprint:
+        return "ok"
+    for attempt in range(2):
+        try:
+            await _await_telegram_mutation(
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    rich_message=screen.telegram_content(html_text=html_text),
+                    parse_mode=None,
+                    reply_markup=reply_markup,
+                )
+            )
+            _screen_fingerprints[chat_id] = fingerprint
+            _screen_callbacks[chat_id] = _callback_values(reply_markup)
+            return "ok"
+        except TelegramRetryAfter as error:
+            if attempt:
+                return "temporary_failure"
+            await asyncio.sleep(min(float(error.retry_after), 30.0))
+        except TelegramNotFound:
+            return "missing"
+        except TelegramForbiddenError as error:
+            if _is_media_only_forbidden(error):
+                logger.warning(
+                    f"Telegram запретил media rich edit для chat {chat_id}; "
+                    "переключаюсь на текстовый экран"
+                )
+                return "rich_unsupported"
+            logger.warning(f"Telegram запретил rich edit для chat {chat_id}: {error}")
+            return "permanent_failure"
+        except TelegramBadRequest as error:
+            error_text = str(error).lower()
+            if "message is not modified" in error_text:
+                _screen_fingerprints[chat_id] = fingerprint
+                _screen_callbacks[chat_id] = _callback_values(reply_markup)
+                return "ok"
+            if any(
+                marker in error_text
+                for marker in (
+                    "message to edit not found",
+                    "message_id_invalid",
+                )
+            ):
+                return "missing"
+            if any(
+                marker in error_text
+                for marker in (
+                    "message can't be edited",
+                    "message can not be edited",
+                )
+            ):
+                return "uneditable"
+            logger.warning(
+                f"Telegram отклонил rich edit {chat_id}/{message_id}; "
+                f"переключаюсь на текстовый экран: {error}"
+            )
+            return "rich_unsupported"
+        except (TelegramNetworkError, TelegramServerError) as error:
+            if attempt:
+                logger.warning(
+                    f"Временная ошибка Telegram rich edit {chat_id}: {error}"
+                )
+                return "temporary_failure"
+            await asyncio.sleep(0.5)
+        except TelegramAPIError as error:
+            logger.warning(
+                f"Ошибка Telegram rich edit {chat_id}/{message_id}: {error}"
+            )
+            return "temporary_failure"
+    return "temporary_failure"
+
+
+async def _telegram_edit_rich_or_fallback(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    body: RichScreenBody,
+    reply_markup: Optional[InlineKeyboardMarkup],
+    *,
+    banners: Optional[list[tuple[str, str]]] = None,
+    verify_exists: bool = False,
+    expected_revision: Optional[int] = None,
+) -> tuple[str, str]:
+    """Return ``(outcome, visible_mode)`` for a rich-or-text delivery."""
+    revision = (
+        _screen_revisions.get(chat_id, 0)
+        if expected_revision is None
+        else expected_revision
+    )
+    if isinstance(body, RichPhotoScreen) and not _rich_is_disabled(
+        chat_id,
+        revision,
+    ):
+        result = await _telegram_edit_rich(
+            bot,
+            chat_id,
+            message_id,
+            body,
+            reply_markup,
+            banners=banners,
+            verify_exists=verify_exists,
+        )
+        if result != "rich_unsupported":
+            return result, "rich"
+        if not _disable_rich_for_revision(chat_id, revision):
+            return "stale", "rich"
+
+    fallback = _compose_with_banners(
+        _rich_fallback_text(body),
+        banners,
+    )
+    result = await _telegram_edit(
+        bot,
+        chat_id,
+        message_id,
+        fallback,
+        reply_markup,
+        verify_exists=verify_exists,
+    )
+    return result, "text"
+
+
+def _commit_rich_body(
+    chat_id: int,
+    body: RichScreenBody,
+    reply_markup: Optional[InlineKeyboardMarkup],
+    mode: str,
+) -> None:
+    """Commit only content that Telegram confirmed as visible."""
+    fallback = _rich_fallback_text(body)
+    _screen_views[chat_id] = (fallback, reply_markup)
+    if mode == "rich":
+        if not isinstance(body, RichPhotoScreen):
+            raise RuntimeError("Text fallback cannot be committed as rich content")
+        _screen_rich_views[chat_id] = (body, reply_markup)
+    else:
+        _screen_rich_views.pop(chat_id, None)
 
 
 async def _edit_view(
@@ -409,6 +751,7 @@ async def _edit_view(
             return "stale"
         markup = _protect_destructive_callbacks(chat_id, markup)
         _screen_views[chat_id] = (text, markup)
+        _screen_rich_views.pop(chat_id, None)
         if dismiss_events:
             _dismiss_visible_events(chat_id)
         return await _telegram_edit(
@@ -421,6 +764,60 @@ async def _edit_view(
         )
 
 
+async def _edit_rich_view(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    body: RichScreenBody,
+    markup: Optional[InlineKeyboardMarkup],
+    *,
+    dismiss_events: bool = False,
+    verify_exists: bool = False,
+    expected_revision: Optional[int] = None,
+) -> str:
+    async with _lock(chat_id):
+        if (
+            _screen_messages.get(chat_id, message_id) != message_id
+            or (
+                expected_revision is not None
+                and _screen_revisions.get(chat_id, 0) != expected_revision
+            )
+        ):
+            return "stale"
+        revision = _screen_revisions.get(chat_id, 0)
+        markup = _protect_destructive_callbacks(chat_id, markup)
+        previous_banners = list(_event_banners.get(chat_id, []))
+        if dismiss_events:
+            _dismiss_visible_events(chat_id)
+        try:
+            result, mode = await _telegram_edit_rich_or_fallback(
+                bot,
+                chat_id,
+                message_id,
+                body,
+                markup,
+                banners=_event_banners.get(chat_id),
+                verify_exists=verify_exists,
+                expected_revision=revision,
+            )
+        except BaseException:
+            if dismiss_events:
+                _restore_event_banners(chat_id, previous_banners)
+            raise
+        if (
+            _screen_messages.get(chat_id) != message_id
+            or _screen_revisions.get(chat_id, 0) != revision
+        ):
+            if dismiss_events:
+                _restore_event_banners(chat_id, previous_banners)
+            return "stale"
+        if result == "ok":
+            _commit_rich_body(chat_id, body, markup, mode)
+        elif dismiss_events:
+            _restore_event_banners(chat_id, previous_banners)
+        return result
+
+
 async def _replacement(
     message: Message,
     text: str,
@@ -429,12 +826,16 @@ async def _replacement(
     chat_id = message.chat.id
     async with _lock(chat_id):
         markup = _protect_destructive_callbacks(chat_id, markup)
-        replacement = await message.answer(
-            _safe_text(_compose(chat_id, text)),
-            reply_markup=markup,
-            parse_mode="HTML",
+        replacement = await _await_telegram_mutation(
+            message.answer(
+                _safe_text(_compose(chat_id, text)),
+                reply_markup=markup,
+                parse_mode="HTML",
+            ),
+            propagate_cancel=False,
         )
         _screen_views[chat_id] = (text, markup)
+        _screen_rich_views.pop(chat_id, None)
         _screen_fingerprints.pop(chat_id, None)
         await _remember(replacement)
         _screen_callbacks[chat_id] = _callback_values(markup)
@@ -484,6 +885,7 @@ async def render_if_current(
             return None
         reply_markup = _protect_destructive_callbacks(chat_id, reply_markup)
         _screen_views[chat_id] = (text, reply_markup)
+        _screen_rich_views.pop(chat_id, None)
         _dismiss_visible_events(chat_id)
         result = await _telegram_edit(
             message.bot,
@@ -498,10 +900,159 @@ async def render_if_current(
             return None
         if result != "missing":
             return message
-        replacement = await message.answer(
-            _safe_text(_compose(chat_id, text)),
-            reply_markup=reply_markup,
-            parse_mode="HTML",
+        replacement = await _await_telegram_mutation(
+            message.answer(
+                _safe_text(_compose(chat_id, text)),
+                reply_markup=reply_markup,
+                parse_mode="HTML",
+            ),
+            propagate_cancel=False,
+        )
+        _screen_fingerprints.pop(chat_id, None)
+        await _remember(replacement)
+        _screen_callbacks[chat_id] = _callback_values(reply_markup)
+        return replacement
+
+
+async def render_rich_if_current(
+    token: tuple[int, int, int],
+    message: Message,
+    body: RichScreenBody,
+    reply_markup: Optional[InlineKeyboardMarkup],
+) -> Optional[Message]:
+    """Render a rich image or text fallback only for its originating route."""
+    chat_id, message_id, revision = token
+    async with _lock(chat_id):
+        if (
+            message.chat.id != chat_id
+            or message.message_id != message_id
+            or _screen_messages.get(chat_id) != message_id
+            or _screen_revisions.get(chat_id) != revision
+        ):
+            return None
+        reply_markup = _protect_destructive_callbacks(chat_id, reply_markup)
+        previous_banners = list(_event_banners.get(chat_id, []))
+        _dismiss_visible_events(chat_id)
+        try:
+            result, mode = await _telegram_edit_rich_or_fallback(
+                message.bot,
+                chat_id,
+                message_id,
+                body,
+                reply_markup,
+                banners=_event_banners.get(chat_id),
+                verify_exists=True,
+                expected_revision=revision,
+            )
+        except BaseException:
+            _restore_event_banners(chat_id, previous_banners)
+            raise
+        if (
+            _screen_messages.get(chat_id) != message_id
+            or _screen_revisions.get(chat_id, 0) != revision
+        ):
+            _restore_event_banners(chat_id, previous_banners)
+            return None
+        if result == "ok":
+            _commit_rich_body(chat_id, body, reply_markup, mode)
+            return message
+        if result == "permanent_failure":
+            await _deactivate_target(chat_id)
+            return None
+        if result == "uneditable":
+            _restore_event_banners(chat_id, previous_banners)
+            logger.warning(
+                f"Canonical Telegram message {chat_id}/{message_id} "
+                "больше нельзя редактировать; replacement не создаю"
+            )
+            return None
+        if result != "missing":
+            _restore_event_banners(chat_id, previous_banners)
+            return message
+
+        replacement_mode = mode
+        try:
+            if mode == "rich":
+                if not isinstance(body, RichPhotoScreen):
+                    raise RuntimeError("Text fallback cannot be sent as rich content")
+                try:
+                    replacement = await _await_telegram_mutation(
+                        message.answer_rich(
+                            body.telegram_content(
+                                html_text=_compose_with_banners(
+                                    body.html,
+                                    _event_banners.get(chat_id),
+                                )
+                            ),
+                            reply_markup=reply_markup,
+                        ),
+                        propagate_cancel=False,
+                    )
+                except TelegramBadRequest as error:
+                    logger.warning(
+                        f"Telegram отклонил rich replacement {chat_id}; "
+                        f"переключаюсь на текстовый экран: {error}"
+                    )
+                    if not _disable_rich_for_revision(chat_id, revision):
+                        _restore_event_banners(chat_id, previous_banners)
+                        return None
+                    replacement_mode = "text"
+                    replacement = await _await_telegram_mutation(
+                        message.answer(
+                            _safe_text(
+                                _compose_with_banners(
+                                    _rich_fallback_text(body),
+                                    _event_banners.get(chat_id),
+                                )
+                            ),
+                            reply_markup=reply_markup,
+                            parse_mode="HTML",
+                        ),
+                        propagate_cancel=False,
+                    )
+                except TelegramForbiddenError as error:
+                    if not _is_media_only_forbidden(error):
+                        await _deactivate_target(chat_id)
+                        return None
+                    if not _disable_rich_for_revision(chat_id, revision):
+                        _restore_event_banners(chat_id, previous_banners)
+                        return None
+                    replacement_mode = "text"
+                    replacement = await _await_telegram_mutation(
+                        message.answer(
+                            _safe_text(
+                                _compose_with_banners(
+                                    _rich_fallback_text(body),
+                                    _event_banners.get(chat_id),
+                                )
+                            ),
+                            reply_markup=reply_markup,
+                            parse_mode="HTML",
+                        ),
+                        propagate_cancel=False,
+                    )
+            else:
+                replacement = await _await_telegram_mutation(
+                    message.answer(
+                        _safe_text(
+                            _compose_with_banners(
+                                _rich_fallback_text(body),
+                                _event_banners.get(chat_id),
+                            )
+                        ),
+                        reply_markup=reply_markup,
+                        parse_mode="HTML",
+                    ),
+                    propagate_cancel=False,
+                )
+        except BaseException:
+            _restore_event_banners(chat_id, previous_banners)
+            raise
+        _commit_rich_body(
+            chat_id,
+            body,
+            reply_markup,
+            replacement_mode,
         )
         _screen_fingerprints.pop(chat_id, None)
         await _remember(replacement)
@@ -534,12 +1085,16 @@ async def render_command_screen(
     async with _lock(chat_id):
         _event_banners.pop(chat_id, None)
         reply_markup = _protect_destructive_callbacks(chat_id, reply_markup)
-        response = await message.answer(
-            _safe_text(text),
-            reply_markup=reply_markup,
-            parse_mode="HTML",
+        response = await _await_telegram_mutation(
+            message.answer(
+                _safe_text(text),
+                reply_markup=reply_markup,
+                parse_mode="HTML",
+            ),
+            propagate_cancel=False,
         )
         _screen_views[chat_id] = (text, reply_markup)
+        _screen_rich_views.pop(chat_id, None)
         _screen_fingerprints.pop(chat_id, None)
         await _remember(response)
         _screen_callbacks[chat_id] = _callback_values(reply_markup)
@@ -591,7 +1146,7 @@ async def start_live_updates(
                 if result == "permanent_failure":
                     await _deactivate_target(chat_id)
                     return
-                if result in {"missing", "stale"}:
+                if result in {"missing", "stale", "uneditable"}:
                     return
         except asyncio.CancelledError:
             raise
@@ -631,6 +1186,90 @@ async def render_live_screen(
     await start_live_updates(canonical, loader, interval_seconds)
 
 
+async def start_rich_live_updates(
+    message: Message,
+    loader: RichScreenLoader,
+    interval_seconds: float = 30.0,
+) -> None:
+    await stop_live_updates(message.chat.id)
+    await _remember(message)
+    chat_id = message.chat.id
+    message_id = message.message_id
+    bot = message.bot
+    revision = _screen_revisions.get(chat_id, 0)
+
+    async def refresh_loop() -> None:
+        delay = interval_seconds
+        try:
+            while True:
+                await asyncio.sleep(delay)
+                if (
+                    _screen_messages.get(chat_id) != message_id
+                    or _screen_revisions.get(chat_id) != revision
+                ):
+                    return
+                try:
+                    body, markup = await loader()
+                    delay = interval_seconds
+                except Exception as error:
+                    delay = min(90.0, max(interval_seconds, delay * 1.8))
+                    logger.warning(
+                        f"Rich live-экран {chat_id} временно устарел; "
+                        f"повтор через {delay:.0f}с: {error}"
+                    )
+                    continue
+                result = await _edit_rich_view(
+                    bot,
+                    chat_id,
+                    message_id,
+                    body,
+                    markup,
+                    expected_revision=revision,
+                )
+                if result == "permanent_failure":
+                    await _deactivate_target(chat_id)
+                    return
+                if result in {"missing", "stale", "uneditable"}:
+                    return
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if _live_tasks.get(chat_id) is asyncio.current_task():
+                _live_tasks.pop(chat_id, None)
+
+    _live_tasks[chat_id] = asyncio.create_task(
+        refresh_loop(),
+        name=f"telegram-rich-live-{chat_id}",
+    )
+
+
+async def render_rich_live_screen(
+    message: Message,
+    loader: RichScreenLoader,
+    interval_seconds: float = 30.0,
+) -> None:
+    """Refresh rich or text chart content without creating another message."""
+    token = current_screen_token(message)
+    try:
+        body, markup = await loader()
+    except Exception as error:
+        logger.error(f"Не удалось загрузить rich live-экран: {error}")
+        from telegram_bot.keyboards.main_menu import get_main_menu
+
+        await render_if_current(
+            token,
+            message,
+            "❌ <b>График временно недоступен</b>\n\n"
+            "Последнее сообщение сохранено. Попробуйте обновить график позже.",
+            get_main_menu(),
+        )
+        return
+    canonical = await render_rich_if_current(token, message, body, markup)
+    if canonical is None:
+        return
+    await start_rich_live_updates(canonical, loader, interval_seconds)
+
+
 async def _render_event(
     text: str,
     chat_ids: list[int],
@@ -648,22 +1287,49 @@ async def _render_event(
             if not message_id or not base:
                 outcomes[chat_id] = "unavailable"
                 continue
+            delivery_revision = _screen_revisions.get(chat_id, 0)
             previous = list(_event_banners.get(chat_id, []))
             proposed = previous
             if not any(item[0] == key for item in previous):
                 proposed = (previous + [(key, text[:1_000])])[-5:]
-            result = await _telegram_edit(
-                _bot,
-                chat_id,
-                message_id,
-                _compose_with_banners(base[0], proposed),
-                base[1],
-                verify_exists=True,
-            )
+            rich_base = _screen_rich_views.get(chat_id)
+            if rich_base:
+                result, mode = await _telegram_edit_rich_or_fallback(
+                    _bot,
+                    chat_id,
+                    message_id,
+                    rich_base[0],
+                    rich_base[1],
+                    banners=proposed,
+                    verify_exists=True,
+                    expected_revision=delivery_revision,
+                )
+            else:
+                mode = "text"
+                result = await _telegram_edit(
+                    _bot,
+                    chat_id,
+                    message_id,
+                    _compose_with_banners(base[0], proposed),
+                    base[1],
+                    verify_exists=True,
+                )
+            if (
+                _screen_messages.get(chat_id) != message_id
+                or _screen_revisions.get(chat_id, 0) != delivery_revision
+            ):
+                result = "stale"
             # Publish banner state only after Telegram confirms that this exact
             # composition became visible.  Update-arrival snapshots therefore
             # never acknowledge an in-flight or failed outbox delivery.
             if result == "ok":
+                if rich_base:
+                    _commit_rich_body(
+                        chat_id,
+                        rich_base[0],
+                        rich_base[1],
+                        mode,
+                    )
                 if proposed:
                     _event_banners[chat_id] = proposed
                 else:
