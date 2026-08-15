@@ -1,12 +1,12 @@
 # HTTP and external APIs
-requests>=2.31.0,<3
-openai>=1.60.0,<3
-python-dotenv>=1.0.0,<2
+requests>=2.34.2,<3
+openai>=3.1.0,<4
+python-dotenv>=1.2.2,<2
 
 # Market calculations and logs
-numpy>=1.24.0,<3
-matplotlib>=3.10.8,<4
-loguru>=0.7.0,<1
+numpy>=2.5.2,<3
+matplotlib>=3.11.1,<4
+loguru>=0.7.3,<1
 
 # Telegram
 aiogram>=3.30.0,<4

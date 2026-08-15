@@ -4,7 +4,7 @@
 
 🌐 **Язык:** [Русский](README.md) · [English](README_EN.md)
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.14%2B-3776AB?logo=python&logoColor=white)
 ![Aiogram](https://img.shields.io/badge/aiogram-3.30%2B-2CA5E0?logo=telegram&logoColor=white)
 ![Bybit](https://img.shields.io/badge/Bybit-V5-F7A600)
 ![License](https://img.shields.io/badge/License-MIT-2EA44F)
@@ -151,7 +151,7 @@ telegram_bot/handlers/
 
 ## Установка
 
-Требуется Python 3.10+.
+Требуется Python 3.14+; рекомендуется актуальный патч 3.14.6. Launcher использует pip 26.1.2, setuptools 84.0.0 и wheel 0.48.0.
 
 ```powershell
 git clone https://github.com/soroka01/TgBot-Bybot-control.git
