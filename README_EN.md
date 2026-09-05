@@ -1,87 +1,34 @@
-# 🤖 Crypto Trading Bot for Bybit
+# Crypto Trading Bot for Bybit
 
-> One Telegram message for controlling a Bybit Unified Account: positions, durable trade history and statistics, a live candlestick chart, alerts, safe AI setup selection, and optional automated execution.
+[Русский](README.md) · [English](README_EN.md)
 
-🌐 **Language:** [Русский](README.md) · [English](README_EN.md)
+Telegram panel for a Bybit Unified Account: positions, trade history, charts, and alerts. DeepSeek selects from setups calculated by code; code controls risk and execution. The default `dry` mode sends no trading requests.
 
-![Python](https://img.shields.io/badge/Python-3.14%2B-3776AB?logo=python&logoColor=white)
-![Aiogram](https://img.shields.io/badge/aiogram-3.30%2B-2CA5E0?logo=telegram&logoColor=white)
-![Bybit](https://img.shields.io/badge/Bybit-V5-F7A600)
-![License](https://img.shields.io/badge/License-MIT-2EA44F)
+## Quick start
 
-## What it is
+Requires Python 3.14+.
 
-The bot controls one shared Bybit Unified futures account and is designed for the owner's private Telegram chat. It does not promise returns and does not turn an LLM into a trader: DeepSeek may only select a setup precomputed by local code or decline it.
+```powershell
+git clone https://github.com/soroka01/TgBot-Bybot-control.git
+cd TgBot-Bybot-control
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
 
-| Layer | Design |
-| --- | --- |
-| Telegram | One canonical bot message per chat; navigation and live data edit it |
-| AI | Selects an existing `candidate_id`; cannot set quantity, leverage, TP, or SL |
-| Risk | Local code calculates size, fees, spread, slippage, net R/R, and leverage |
-| Bybit | Live instrument rules, stable `orderLinkId`, and execution reconciliation |
-| Storage | SQLite for exact entry plans, Closed PnL, equity snapshots, profiles, alerts, and outbox |
-| Default | `TRADING_MODE=dry`; mutating requests never reach the exchange |
+`start.bat` creates `.venv` when needed, installs missing dependencies, and launches the Telegram UI. Use the commands in “Running” for console modes.
 
-> ⚠️ This is a technical risk-control tool, not financial advice. Losing trades, slippage, liquidation, API failures, and loss of capital remain possible.
+## How it works
 
-## Highlights
-
-### One Telegram screen
-
-- `/start` creates the first bot message; subsequent UI operations edit it.
-- A temporary Telegram failure, rate limit, or network error never creates a duplicate.
-- A replacement bot message is allowed only when Telegram explicitly reports that the old one is gone or cannot be edited.
-- Callbacks from an old message or replaced keyboard are rejected.
-- Edits are serialized per chat; stale live tasks are cancelled and awaited.
-- Auto events appear as a small banner without destroying the current route.
-- After restart, a persisted screen is changed to an honest “bot restarted” state.
-
-The live chart is a PNG embedded in a Telegram rich message—not a separate media post or a new message. Menus, charts, and ordinary text screens can therefore replace one another through `editMessageText` while retaining the same `message_id`, without the media-caption limit. An accessible text fallback remains available if the chart cannot be rendered.
-
-Matplotlib Agg renders the chart locally from exact confirmed Bybit candles: candlesticks, EMA20/EMA50, volume, and the current price. The 14-day low comes from 14 separate confirmed daily candles. A distant level is labeled as outside the visible scale instead of flattening the displayed candles.
-
-### AI is a selector, not an executor
-
-1. Code loads positions, equity, bid/ask/mark, funding, and closed 3m/5m/1h/4h candles.
-2. Code determines the regime and builds an allowed setup with fixed entry reference, TP, and SL.
-3. DeepSeek receives a compact allow-listed snapshot without raw Bybit responses, keys, or free-form text.
-4. DeepSeek returns only `hold` or `select_candidate` with an existing ID; it cannot close positions.
-5. A strict local schema checks the `snapshot_id`, expiry, symbols, states, and extra fields.
-6. Bid/ask, spread, and price drift are checked again immediately before an order.
-
-Malformed JSON, an expired snapshot, incomplete timeframes, or an invented ID rejects the complete batch without orders.
-
-The default is the current `deepseek-v4-flash` model with JSON Output and thinking mode disabled. Override it through `DEEPSEEK_MODEL`.
-
-### Deterministic risk
-
-- quantity comes from equity and stop distance;
-- the model cannot influence quantity, leverage, or risk budget;
-- taker fees, current spread, and estimated adverse slippage are included in risk and net R/R;
-- open-position risk is measured from executable `markPrice` to SL, not historical entry;
-- quantity and price levels use `Decimal` with live `qtyStep` and `tickSize`;
-- `minOrderQty`, `minNotionalValue`, `maxMktOrderQty`, instrument status, and max leverage are enforced;
-- leverage is the minimum required, capped by `AUTO_LEVERAGE` and the instrument;
-- automated entries are allowed only for a Unified Account in `REGULAR_MARGIN`; `ISOLATED_MARGIN`, `PORTFOLIO_MARGIN`, and unknown modes are blocked;
-- new entries are also blocked by an unprotected position, exposure-increasing open order, unsafe position status, unsupported USDC/inverse/options exposure, malformed account-wide balance fields, or the daily loss guard;
-- automatic stops may tighten but never widen;
-- exits are owned only by TP/SL, deterministic safety guards, or an owner-confirmed manual action; implicit reversals are prohibited;
-- each candle candidate can be reserved only once in SQLite;
-- the final plan, AI reason, snapshot, and sizing context are committed before `create-order`; failure of this mandatory write blocks a new LIVE entry.
-
-### Reliable Bybit execution
-
-- GET requests use backoff; mutating POST requests are never blindly retried after a timeout.
-- Every logical order has a stable unique `orderLinkId`.
-- A lost response triggers lookup by that ID through realtime/history instead of a second order.
-- `order/create` is treated as an asynchronous acknowledgement only.
-- Success is shown after terminal `Filled` status and actual position verification.
-- Auto entry uses a marketable IOC Limit with a hard price boundary and attached Full TP/SL.
-- An entry is also checked for TP and SL; if protection cannot be restored, the bot attempts an emergency close.
-- A partially filled safety exit is immediately reconciled and retried a bounded number of times; an uncertain remainder fail-stops auto mode.
-- `set_trading_stop` always sends paired TP and SL with `tpslMode=Full`, Market execution, and MarkPrice triggers.
-- Signature time is synchronized with Bybit and rate-limit headers are respected.
-- Positions, active orders, and Closed PnL are paginated.
+```mermaid
+flowchart TD
+    A["Market data"] --> B["Calculated setups"]
+    B["Calculated setups"] --> C["AI selection"]
+    C["AI selection"] --> D["Risk checks"]
+    D["Risk checks"] --> E["dry / Bybit execution"]
+    E["dry / Bybit execution"] --> F["SQLite + Telegram"]
+```
 
 ## Screens
 
@@ -109,60 +56,6 @@ Trading, account, and AI callbacks are restricted to IDs in `ADMIN_TELEGRAM_IDS`
 - SQLite retains the original Bybit record, exact local plan, snapshot, selector decision, and sizing context for later auditing without overloading Telegram.
 - Equity change and account-level drawdown percentages appear only after equity snapshots exist. They are not cash-flow adjusted, so Closed PnL remains the primary strategy measure. Sharpe/Sortino are intentionally omitted without a sufficient, correctly sampled daily equity curve.
 - In UTA 2.0 isolated margin, documented empty account-wide margin/available fields are not treated as an equity-snapshot error: optional available balance is derived from USDT coin fields, while zero equity is skipped cleanly. The strict trading-path parser remains unchanged.
-
-## Architecture
-
-```text
-Telegram update
-  └─> private-chat/access/stale-screen guards
-       └─> single-message Screen Manager
-            ├─> handlers ───────────────> read screens / confirmed actions
-            ├─> alert scheduler ────────> durable notification outbox
-            └─> atomic auto worker
-                  ├─> closed-candle features
-                  ├─> deterministic candidates
-                  ├─> DeepSeek selector
-                  ├─> deterministic risk engine
-                  ├─> durable trade plan before entry
-                  └─> serialized Bybit execution + reconciliation
-
-Bybit Closed PnL ──> 7-day cursor sync ──> SQLite trade journal
-                                               └─> Decimal analytics ──> one-message screen
-```
-
-```text
-api/
-  bybit_api.py          signing, metadata, pagination, orders, reconciliation
-  deepseek_api.py       current model, JSON Output, bounded/private logging
-core/
-  decision_engine.py    snapshot, candidates, strict AI schema
-  risk_engine.py        Decimal sizing, costs, gates, portfolio risk
-  market_data.py        closed candles and technical features
-  chart.py              closed-candle PNG, EMA/volume/14D low, text fallback
-  trade_journal.py       account-scoped Closed PnL sync and entry audit trail
-  trade_analytics.py     Decimal metrics and partial-close grouping
-  auto_trading.py       cycle and serialized side effects
-  alerts.py             crossing logic
-storage/database.py     SQLite repository, trade history, equity, and outbox
-telegram_bot/ui.py      one-message text/rich state, locks, revisions, live tasks
-telegram_bot/handlers/
-  history.py            compact period/scope performance screen
-```
-
-## Installation
-
-Python 3.14+ is required; the latest 3.14.6 patch is recommended. The launcher uses pip 26.1.2, setuptools 84.0.0, and wheel 0.48.0.
-
-```powershell
-git clone https://github.com/soroka01/TgBot-Bybot-control.git
-cd TgBot-Bybot-control
-py -3 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-Copy-Item .env.example .env
-```
-
-`start.bat` creates `.venv` when needed, installs missing dependencies, and launches the Telegram UI. Use the commands in “Running” for console modes.
 
 ## Configuration
 
@@ -232,16 +125,6 @@ python main.py
 
 Before auto mode starts, the application validates keys, model ID, mode, and bounds. Telegram LIVE mode also requires an in-screen confirmation.
 
-## Verification
-
-```powershell
-python -m compileall -q main.py config.py api core storage telegram_bot utils
-python -m pip check
-git diff --check
-```
-
-Use Bybit Demo/Testnet for integration checks. The verification commands above do not submit orders.
-
 ## Runtime data and privacy
 
 | Path | Data |
@@ -260,7 +143,6 @@ Use a Bybit API key with read/trade permissions and **without withdrawal permiss
 
 - The bot supports linear USDT contracts and one process/one Unified Account; automated entries require `REGULAR_MARGIN`.
 - SQLite does not coordinate multiple simultaneously running application instances.
-- REST reconciliation is safer than trusting an ACK, but a private WebSocket could further reduce latency.
 - Initial statistics are limited by available Bybit Closed PnL and locally accumulated snapshots; the bot backfills at most the selected year and does not later delete those trade records.
 - Auto mode is deliberately conservative and may find no setup for long periods.
 - Editing an existing Telegram message usually does not produce a full push notification. Alerts are durable in-app banners, not a must-not-miss channel.
@@ -269,8 +151,12 @@ Use a Bybit API key with read/trade permissions and **without withdrawal permiss
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE).
+
+## Support
+
+Feel free to [fork this repository](https://github.com/soroka01/TgBot-Bybot-control/fork) and adapt it. If it helped you, leave a [Star](https://github.com/soroka01/TgBot-Bybot-control) so I can see it was useful.
 
 ---
 
-One screen. AI cannot size positions. Execution happens only after local checks and exchange confirmation.
+with love ❤️
