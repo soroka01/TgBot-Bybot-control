@@ -1,18 +1,19 @@
+# Python
 __pycache__/
 *.py[cod]
 .venv/
-venv/
-*.log
-logs/
-*.sqlite3
-*.sqlite3-*
+
+# Secrets
 .env
 *.env
+!.env.example
 *.pem
 *.key
 secrets.*
-api/deepseek_logs/
-deepseek_logs/
 
-# Downloaded kline history for tools/backtest.py
+# Runtime data
+*.log
+logs/
+*.sqlite3*
+deepseek_logs/
 data/history/
