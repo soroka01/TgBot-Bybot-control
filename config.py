@@ -141,6 +141,7 @@ MAX_RISK_PER_TRADE_PERCENT = _env_float("MAX_RISK_PER_TRADE_PERCENT", 1.0)
 MAX_TOTAL_RISK_PERCENT = _env_float("MAX_TOTAL_RISK_PERCENT", 5.0)
 MAX_DAILY_LOSS_PERCENT = _env_float("MAX_DAILY_LOSS_PERCENT", 3.0)
 MAX_POSITION_NOTIONAL_PERCENT = _env_float("MAX_POSITION_NOTIONAL_PERCENT", 100.0)
+MAX_SAME_SIDE_POSITIONS = _env_int("MAX_SAME_SIDE_POSITIONS", 2)
 MIN_ORDER_SIZE_USDT = _env_float("MIN_ORDER_SIZE_USDT", 10.0)
 MIN_NET_RISK_REWARD_RATIO = _env_float("MIN_NET_RISK_REWARD_RATIO", 1.5)
 MAX_SPREAD_PERCENT = _env_float("MAX_SPREAD_PERCENT", 0.15)
@@ -192,6 +193,8 @@ def validate_config(mode: str = "telegram") -> list[str]:
         )
     if not 0 < MAX_DAILY_LOSS_PERCENT <= 25:
         errors.append("MAX_DAILY_LOSS_PERCENT должен быть больше 0 и не выше 25")
+    if not 1 <= MAX_SAME_SIDE_POSITIONS <= 12:
+        errors.append("MAX_SAME_SIDE_POSITIONS должен быть в диапазоне 1–12")
     if MIN_ORDER_SIZE_USDT <= 0:
         errors.append("MIN_ORDER_SIZE_USDT должен быть больше нуля")
     if POLL_INTERVAL < 30:

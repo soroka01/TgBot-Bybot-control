@@ -12,6 +12,7 @@ from config import (
     BYBIT_MAX_SLIPPAGE_PERCENT,
     ESTIMATED_SLIPPAGE_PERCENT,
     FALLBACK_TAKER_FEE_RATE,
+    MAX_SAME_SIDE_POSITIONS,
     MIN_NET_RISK_REWARD_RATIO,
     SIGNAL_VALIDITY_SECONDS,
 )
@@ -21,6 +22,10 @@ from core.risk_engine import D
 SNAPSHOT_SCHEMA = "trade_snapshot.v1"
 DECISION_SCHEMA = "trade_decision.v1"
 ALLOWED_ACTIONS = {"hold", "select_candidate"}
+# Fixed reward multiple.  A 150-day, 6-symbol backtest (tools/backtest.py)
+# showed the former "farther of 1h swing and 2R" target was reached in only
+# ~14% of trades (-0.67R expectancy); a plain 2R target removed that bleed.
+TARGET_RISK_MULTIPLE = Decimal("2.0")
 ALLOWED_REASONS = {
     "candidate_selected",
     "no_edge",
@@ -60,6 +65,7 @@ def _net_rr(
     target: Decimal,
     fee_rate: Decimal,
     spread_bps: Decimal,
+    funding_rate: Decimal = Decimal("0"),
 ) -> Decimal:
     risk = entry - stop if side == "Buy" else stop - entry
     reward = target - entry if side == "Buy" else entry - target
@@ -68,6 +74,9 @@ def _net_rr(
         + D(BYBIT_MAX_SLIPPAGE_PERCENT) / 100
         + D(ESTIMATED_SLIPPAGE_PERCENT) / 100
         + spread_bps / 10_000
+        # One settlement is charged only when our side pays; a received
+        # funding payment is never counted as a guaranteed benefit.
+        + max(Decimal("0"), funding_rate if side == "Buy" else -funding_rate)
     )
     cost = entry * cost_rate
     return (reward - cost) / (risk + cost) if risk + cost > 0 else Decimal("-1")
@@ -83,7 +92,6 @@ def _candidate(
     if regime not in {"trend_up", "trend_down"}:
         return []
     frame_5m = analysis["timeframe_5m"]
-    frame_1h = analysis["timeframe_1h"]
     entry = D(market["ask"] if regime == "trend_up" else market["bid"])
     atr = D(frame_5m["atr14"])
     if entry <= 0 or atr <= 0:
@@ -99,23 +107,19 @@ def _candidate(
         structural_stop = D(frame_5m["swing_low"]) - atr * D("0.10")
         stop = min(structural_stop, entry - atr * D("1.20"))
         risk = entry - stop
-        target = max(
-            D(frame_1h["swing_high"]),
-            entry + risk * D("2.0"),
-        )
+        target = entry + risk * TARGET_RISK_MULTIPLE
     else:
         side = "Sell"
         structural_stop = D(frame_5m["swing_high"]) + atr * D("0.10")
         stop = max(structural_stop, entry + atr * D("1.20"))
         risk = stop - entry
-        target = min(
-            D(frame_1h["swing_low"]),
-            entry - risk * D("2.0"),
-        )
+        target = entry - risk * TARGET_RISK_MULTIPLE
     if risk <= 0 or risk / entry > D("0.05") or target <= 0:
         return []
     spread_bps = D(market["spread_bps"])
-    net_rr = _net_rr(side, entry, stop, target, fee_rate, spread_bps)
+    net_rr = _net_rr(
+        side, entry, stop, target, fee_rate, spread_bps, D(market["funding_rate"])
+    )
     if net_rr < D(MIN_NET_RISK_REWARD_RATIO):
         return []
     identity = "|".join(
@@ -201,6 +205,12 @@ def build_trade_snapshot(
     moment = now or datetime.now(timezone.utc)
     symbols: dict[str, Any] = {}
     fee_rates = fee_rates or {}
+    # Crypto majors are highly correlated: cap simultaneous same-direction
+    # exposure, counting open positions and candidates already offered.
+    side_load = {"Buy": 0, "Sell": 0}
+    for position in positions:
+        if D(position.get("size", 0)) > 0 and position.get("side") in side_load:
+            side_load[position["side"]] += 1
     for token in tokens:
         symbol = f"{token.upper()}USDT"
         ticker = tickers.get(symbol)
@@ -250,6 +260,11 @@ def build_trade_snapshot(
             if state == "flat" and allow_entries and fresh
             else []
         )
+        candidates = [
+            row for row in candidates if side_load[row["side"]] < MAX_SAME_SIDE_POSITIONS
+        ]
+        for row in candidates:
+            side_load[row["side"]] += 1
         symbols[symbol] = {
             "state": state,
             "market": market,
