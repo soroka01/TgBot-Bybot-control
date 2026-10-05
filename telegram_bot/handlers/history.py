@@ -12,6 +12,7 @@ from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup
 
 from api.bybit_api import BybitAPI
+from core.rich_charts import render_trade_performance_png
 from core.trade_journal import TradeJournal
 from telegram_bot.keyboards.history_menu import (
     DEFAULT_HISTORY_PERIOD,
@@ -21,10 +22,11 @@ from telegram_bot.keyboards.history_menu import (
     get_history_menu,
 )
 from telegram_bot.ui import (
+    RichPhotoScreen,
     callback_action,
     current_screen_token,
     render_callback_screen,
-    render_if_current,
+    render_rich_if_current,
 )
 from utils.logger_setup import logger
 
@@ -35,6 +37,12 @@ _SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 _MAX_SPARK_POINTS = 28
 _MAX_RECENT_TRADES = 5
 _MAX_SCREEN_LENGTH = 2_500
+_TRADE_PERFORMANCE_MEDIA_ID = "trade_performance"
+
+
+async def render_if_current(*args: Any, **kwargs: Any):
+    """Compatibility seam that now delegates to the rich-aware renderer."""
+    return await render_rich_if_current(*args, **kwargs)
 
 
 def _decimal(value: Any) -> Optional[Decimal]:
@@ -343,12 +351,124 @@ def format_history_screen(
     return text
 
 
+def _history_rich_html(
+    analytics: dict[str, Any],
+    *,
+    days: int,
+    scope: str,
+    cache_warning: bool,
+    sync_busy: bool,
+) -> str:
+    """Build bounded rich HTML from already aggregated, escaped metrics."""
+    scope_label = "🤖 только бот" if scope == "bot" else "🌐 весь аккаунт"
+    trade_count = _integer(analytics.get("trade_count"))
+    source_record_count = (
+        _integer(analytics.get("source_record_count", trade_count))
+        or trade_count
+    )
+    trade_basis = f"{trade_count} агрегированных сделок"
+    if source_record_count != trade_count:
+        trade_basis += f" · {source_record_count} закрытий"
+    wins = _integer(analytics.get("wins"))
+    losses = _integer(analytics.get("losses"))
+    breakeven = _integer(analytics.get("breakeven"))
+    max_drawdown = abs(_decimal(analytics.get("max_drawdown")) or Decimal("0"))
+    avg_r = _ratio(analytics.get("avg_r"), suffix="R", signed=True)
+    r_count = _integer(analytics.get("r_count"))
+    if r_count and r_count != trade_count:
+        avg_r += f" ({r_count})"
+
+    status = ""
+    if cache_warning:
+        status = (
+            "<p>⚠️ <b>Bybit временно недоступен.</b> "
+            "Отчёт построен по локальному кэшу.</p>"
+        )
+    elif sync_busy:
+        status = (
+            "<p>⏳ <b>Синхронизация уже идёт.</b> "
+            "Отчёт построен по текущему кэшу.</p>"
+        )
+
+    aggregate_trades = analytics.get("trades")
+    recent_source = aggregate_trades if isinstance(aggregate_trades, list) else []
+    recent = sorted(
+        recent_source,
+        key=lambda item: (
+            _integer(item.get("updated_time_ms")),
+            _integer(item.get("closed_at_ms")),
+            _integer(item.get("created_time_ms")),
+            str(item.get("record_id") or item.get("trade_id") or ""),
+        ),
+        reverse=True,
+    )[:_MAX_RECENT_TRADES]
+    recent_html = "<br>".join(_recent_trade_line(record) for record in recent)
+    if not recent_html:
+        recent_html = "—"
+
+    return (
+        f"<h3>📜 История сделок · {days} дн.</h3>"
+        f"<p>{scope_label}</p>"
+        f"{status}"
+        f'<figure><img src="tg://photo?id={_TRADE_PERFORMANCE_MEDIA_ID}"/>'
+        "<figcaption>Cumulative Closed PnL и drawdown · "
+        f"{trade_basis} · UTC / USDT</figcaption></figure>"
+        "<table bordered striped><caption>Ключевые метрики</caption>"
+        "<tr><th>Метрика</th><th>Значение</th></tr>"
+        "<tr><td>Net PnL</td><td><code>"
+        f"{_money(analytics.get('net_pnl'), signed=True)}</code></td></tr>"
+        f"<tr><td>Сделки</td><td><code>{trade_basis}</code><br><code>"
+        f"{wins}W/{losses}L/{breakeven}B · "
+        f"Win {_ratio(analytics.get('win_rate'), suffix='%')}</code></td></tr>"
+        f"<tr><td>PF / Expectancy</td><td><code>"
+        f"{_ratio(analytics.get('profit_factor'))} / "
+        f"{_money(analytics.get('expectancy'), signed=True)}</code></td></tr>"
+        f"<tr><td>Max DD / Avg R</td><td><code>"
+        f"{_money(-max_drawdown)} / {avg_r}</code></td></tr>"
+        "</table>"
+        "<details><summary>Последние сделки · UTC</summary>"
+        f"<p>{recent_html}</p></details>"
+        "<footer>Closed PnL уже включает торговые комиссии и funding. "
+        "Raw equity curve не используется.</footer>"
+    )
+
+
+def _history_rich_screen(
+    analytics: dict[str, Any],
+    fallback_text: str,
+    *,
+    days: int,
+    scope: str,
+    cache_warning: bool,
+    sync_busy: bool,
+) -> RichPhotoScreen:
+    scope_label = "только бот" if scope == "bot" else "весь аккаунт"
+    png = render_trade_performance_png(
+        analytics,
+        days,
+        scope_label,
+    )
+    return RichPhotoScreen(
+        html=_history_rich_html(
+            analytics,
+            days=days,
+            scope=scope,
+            cache_warning=cache_warning,
+            sync_busy=sync_busy,
+        ),
+        photo=png,
+        fallback_text=fallback_text,
+        filename=f"trade-performance-{days}-{scope}.png",
+        media_id=_TRADE_PERFORMANCE_MEDIA_ID,
+    )
+
+
 def build_history_view(
     days: int = DEFAULT_HISTORY_PERIOD,
     scope: str = DEFAULT_HISTORY_SCOPE,
     *,
     force: bool = False,
-) -> tuple[str, InlineKeyboardMarkup]:
+) -> tuple[str | RichPhotoScreen, InlineKeyboardMarkup]:
     """Synchronize the journal and render analytics from durable local rows."""
     if days not in HISTORY_PERIODS or scope not in HISTORY_SCOPES:
         raise ValueError("Некорректный фильтр истории")
@@ -398,7 +518,24 @@ def build_history_view(
             cache_warning=cache_warning,
             sync_busy=sync_busy,
         )
-        return text, get_history_menu(days, scope)
+        body: str | RichPhotoScreen = text
+        aggregate_trades = analytics.get("trades")
+        if isinstance(aggregate_trades, list) and len(aggregate_trades) >= 2:
+            try:
+                body = _history_rich_screen(
+                    analytics,
+                    text,
+                    days=days,
+                    scope=scope,
+                    cache_warning=cache_warning,
+                    sync_busy=sync_busy,
+                )
+            except Exception as error:
+                logger.warning(
+                    "PNG-отчёт истории недоступен; используется текстовый fallback "
+                    f"({type(error).__name__})"
+                )
+        return body, get_history_menu(days, scope)
     finally:
         bybit.close()
 
@@ -439,7 +576,7 @@ async def _render_history(
     )
     token = current_screen_token(canonical)
     try:
-        text, markup = await asyncio.to_thread(
+        body, markup = await asyncio.to_thread(
             build_history_view,
             days,
             scope,
@@ -447,12 +584,12 @@ async def _render_history(
         )
     except Exception as error:
         logger.error(f"Ошибка экрана истории ({type(error).__name__})")
-        text = (
+        body = (
             "❌ <b>Не удалось обработать историю</b>\n\n"
             "Локальные данные не повреждены. Попробуйте обновить экран позже."
         )
         markup = get_history_menu(days, scope)
-    await render_if_current(token, canonical, text, markup)
+    await render_if_current(token, canonical, body, markup)
 
 
 @router.callback_query(F.data == "menu:history")

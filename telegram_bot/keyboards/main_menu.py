@@ -13,7 +13,10 @@ def get_main_menu() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📈 Живой график", callback_data="menu:chart"),
-            InlineKeyboardButton(text="🔍 Рынок", callback_data="menu:market_analysis")
+            InlineKeyboardButton(
+                text="📊 Монитор активов",
+                callback_data="menu:market_analysis",
+            )
         ],
         [
             InlineKeyboardButton(text="🧠 AI-сетапы", callback_data="menu:open_trade"),
@@ -28,7 +31,7 @@ def get_main_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")
         ],
         [
-            InlineKeyboardButton(text="🌍 Обзор рынка", callback_data="menu:trends")
+            InlineKeyboardButton(text="🌍 Крипторынок", callback_data="menu:trends")
         ],
     ])
     return keyboard

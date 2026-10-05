@@ -19,21 +19,33 @@ from core.decision_engine import (
     selected_candidate,
     validate_trade_decision,
 )
-from core.market_data import get_market_analysis
+from core.market_report import (
+    MARKET_REPORT_MEDIA_ID,
+    collect_market_report,
+    format_market_report_rich_html,
+    format_market_report_text,
+    render_market_report_png,
+)
 from core.risk_engine import D, build_trade_plan
 from telegram_bot.keyboards.main_menu import get_main_menu
 from telegram_bot.keyboards.trading_menu import get_trading_menu
 from telegram_bot.ui import (
+    RichPhotoScreen,
     current_screen_token,
     render_callback_screen,
     render_if_current,
-    render_live_screen,
+    render_rich_live_screen,
 )
-from utils.helpers import format_price, to_float
+from utils.helpers import format_price
 from utils.logger_setup import logger
 
 router = Router()
 _ai_tasks: dict[int, asyncio.Task] = {}
+
+
+async def render_live_screen(*args, **kwargs):
+    """Compatibility seam that preserves the rich one-message renderer."""
+    return await render_rich_live_screen(*args, **kwargs)
 
 
 async def shutdown_ai_tasks() -> None:
@@ -133,39 +145,52 @@ def build_ai_recommendations() -> tuple[str, InlineKeyboardMarkup]:
             bybit.close()
 
 
-def build_market_view() -> tuple[str, InlineKeyboardMarkup]:
+def _market_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="↻ Обновить",
+                    callback_data="menu:market_analysis",
+                ),
+                InlineKeyboardButton(
+                    text="◀️ Меню",
+                    callback_data="menu:main",
+                ),
+            ]
+        ]
+    )
+
+
+def build_market_view():
     bybit = BybitAPI()
     try:
-        sections: list[str] = []
-        for token in TRADABLE_TOKENS[:5]:
-            symbol = f"{token}USDT"
-            try:
-                ticker = bybit.get_tickers(symbol)["result"]["list"][0]
-                current = to_float(ticker.get("lastPrice"))
-                change = to_float(ticker.get("price24hPcnt")) * 100
-                bid = to_float(ticker.get("bid1Price"))
-                ask = to_float(ticker.get("ask1Price"))
-                spread = (ask - bid) / ((ask + bid) / 2) * 100 if bid > 0 and ask > 0 else 0
-                analysis = get_market_analysis(bybit, symbol, current)
-                regime = {
-                    "trend_up": "↗ тренд вверх",
-                    "trend_down": "↘ тренд вниз",
-                    "range": "↔ диапазон",
-                }.get(analysis.get("regime"), "данные неполны")
-                rsi = analysis.get("timeframe_1h", {}).get("rsi14")
-                sections.append(
-                    f"🪙 <b>{token}</b> <code>{format_price(current)}</code> "
-                    f"<code>{change:+.2f}%</code>\n"
-                    f"   {regime} · RSI 1ч <code>{to_float(rsi):.1f}</code> · "
-                    f"spread <code>{spread:.3f}%</code>\n"
-                )
-            except Exception as error:
-                logger.warning(f"Не удалось обновить {symbol}: {error}")
-        text = "🔍 <b>Рынок</b> <i>• обновление 15с</i>\n\n"
-        text += "\n".join(sections) if sections else "⚠️ Данные рынка временно недоступны."
-        return text, get_main_menu()
+        snapshot = collect_market_report(bybit, TRADABLE_TOKENS)
     finally:
         bybit.close()
+    fallback_text = format_market_report_text(snapshot)
+    markup = _market_menu()
+    if snapshot.valid_asset_count < 2:
+        return fallback_text, markup
+    try:
+        png = render_market_report_png(snapshot)
+        rich_html = format_market_report_rich_html(snapshot)
+    except Exception as error:
+        logger.warning(
+            "Rich-монитор активов недоступен; используется текстовый fallback "
+            f"({type(error).__name__})"
+        )
+        return fallback_text, markup
+    return (
+        RichPhotoScreen(
+            html=rich_html,
+            photo=png,
+            fallback_text=fallback_text,
+            filename="asset-monitor.png",
+            media_id=MARKET_REPORT_MEDIA_ID,
+        ),
+        markup,
+    )
 
 
 @router.callback_query(F.data == "menu:open_trade")
@@ -228,14 +253,15 @@ async def callback_ai_suggestion(callback: CallbackQuery):
 
 @router.callback_query(F.data == "menu:market_analysis")
 async def callback_market_analysis(callback: CallbackQuery):
-    await callback.answer("Открываю рынок")
+    await callback.answer("Открываю монитор активов")
     canonical = await render_callback_screen(
         callback.message,
-        "🔍 <b>Рынок</b>\n\n⏳ Загружаю цены и закрытые свечи…",
-        get_main_menu(),
+        "📊 <b>Монитор активов</b>\n\n"
+        "⏳ Загружаю цены и историю RSI по закрытым свечам…",
+        _market_menu(),
     )
 
     async def loader():
         return await asyncio.to_thread(build_market_view)
 
-    await render_live_screen(canonical, loader, interval_seconds=15)
+    await render_live_screen(canonical, loader, interval_seconds=60)

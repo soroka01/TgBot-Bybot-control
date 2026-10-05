@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import math
 import sys
 from pathlib import Path
 
@@ -32,6 +33,22 @@ router = Router()
 
 def _open_positions(positions: list[dict]) -> list[dict]:
     return [position for position in positions if to_float(position.get("size")) > 0]
+
+
+def _finite_optional_float(value: object) -> float | None:
+    """Keep unavailable Bybit values unavailable instead of inventing zero."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _positive_optional_float(value: object) -> float | None:
+    parsed = _finite_optional_float(value)
+    return parsed if parsed is not None and parsed > 0 else None
 
 
 def build_positions_view():
@@ -91,33 +108,89 @@ def build_position_details_view(symbol: str, position_idx: int):
         bybit.close()
     quantity = to_float(position.get("size"))
     side = position.get("side", "")
-    entry_price = to_float(position.get("avgPrice", position.get("entryPrice")))
-    current_price = to_float(ticker.get("lastPrice"))
-    leverage = to_float(position.get("leverage"), 1)
-    unrealized_pnl = to_float(position.get("unrealisedPnl"))
-    roi = calculate_position_roi(unrealized_pnl, quantity, entry_price, leverage)
+    if side not in {"Buy", "Sell"}:
+        raise ValueError("Bybit вернул неизвестное направление позиции")
+    entry_price = _positive_optional_float(position.get("avgPrice"))
+    if entry_price is None:
+        entry_price = _positive_optional_float(position.get("entryPrice"))
+    current_price = _positive_optional_float(ticker.get("lastPrice"))
+    if entry_price is None or current_price is None:
+        raise ValueError("Bybit не вернул корректные цены позиции")
+    leverage = _positive_optional_float(position.get("leverage"))
+    unrealized_pnl = _finite_optional_float(position.get("unrealisedPnl"))
+    roi = (
+        calculate_position_roi(
+            unrealized_pnl,
+            quantity,
+            entry_price,
+            leverage,
+        )
+        if leverage is not None and unrealized_pnl is not None
+        else None
+    )
     take_profit = to_float(position.get("takeProfit"))
     stop_loss = to_float(position.get("stopLoss"))
     liquidation_price = to_float(position.get("liqPrice"))
     side_emoji = "🟢" if side == "Buy" else "🔴"
-    pnl_emoji = "💚" if unrealized_pnl >= 0 else "❤️"
+    pnl_emoji = (
+        "💚"
+        if unrealized_pnl is not None and unrealized_pnl >= 0
+        else "❤️"
+        if unrealized_pnl is not None
+        else "⚪"
+    )
+    side_label = "LONG" if side == "Buy" else "SHORT"
+    safe_symbol = html.escape(str(symbol).upper()[:24])
+    take_profit_text = (
+        f"<code>{format_price(take_profit)}</code>"
+        if take_profit > 0
+        else "<b>не установлен</b>"
+    )
+    stop_loss_text = (
+        f"<code>{format_price(stop_loss)}</code>"
+        if stop_loss > 0
+        else "<b>не установлен</b>"
+    )
+    protection = (
+        "🛡 <b>Позиция защищена TP и SL.</b>"
+        if take_profit > 0 and stop_loss > 0
+        else "⚠️ <b>Защита неполная:</b> проверьте TP и SL."
+    )
+    roi_text = (
+        f"<code>{roi:+.2f}%</code>"
+        if roi is not None
+        else "<b>н/д</b>"
+    )
+    leverage_text = (
+        f"<code>{leverage:g}x</code>"
+        if leverage is not None
+        else "<b>н/д</b>"
+    )
+    pnl_text = (
+        f"<code>${unrealized_pnl:+.2f}</code>"
+        if unrealized_pnl is not None
+        else "<b>н/д</b>"
+    )
 
     text = (
-        f"{side_emoji} <b>{symbol} — {side}</b> <i>• обновление 8с</i>\n\n"
-        f"💰 <b>Размер:</b> <code>{quantity:g}</code>\n"
-        f"📊 <b>Вход:</b> <code>{format_price(entry_price)}</code>\n"
-        f"💵 <b>Текущая цена:</b> <code>{format_price(current_price)}</code>\n"
-        f"💼 <b>Номинал:</b> <code>${quantity * current_price:,.2f}</code>\n"
-        f"⚡ <b>Плечо:</b> <code>{leverage:g}x</code>\n\n"
-        f"{pnl_emoji} <b>PnL:</b> <code>${unrealized_pnl:+.2f}</code> | "
-        f"<b>ROI:</b> <code>{roi:+.2f}%</code>\n"
+        f"{side_emoji} <b>{safe_symbol} · {side_label}</b> "
+        "<i>• обновление 8с</i>\n\n"
+        "<b>Результат</b>\n"
+        f"{pnl_emoji} PnL {pnl_text} · "
+        f"ROI {roi_text}\n\n"
+        "<b>Цена и объём</b>\n"
+        f"LAST <code>{format_price(current_price)}</code> · "
+        f"вход <code>{format_price(entry_price)}</code>\n"
+        f"Размер <code>{quantity:g}</code> · "
+        f"номинал <code>${quantity * current_price:,.2f}</code> · "
+        f"плечо {leverage_text}\n\n"
+        "<b>Защитные уровни</b>\n"
+        f"🎯 TP {take_profit_text}\n"
+        f"🛑 SL {stop_loss_text}\n"
     )
-    if take_profit:
-        text += f"🎯 <b>Take Profit:</b> <code>{format_price(take_profit)}</code>\n"
-    if stop_loss:
-        text += f"🛑 <b>Stop Loss:</b> <code>{format_price(stop_loss)}</code>\n"
-    if liquidation_price:
-        text += f"⚠️ <b>Ликвидация:</b> <code>{format_price(liquidation_price)}</code>\n"
+    if liquidation_price > 0:
+        text += f"💥 Ликвидация <code>{format_price(liquidation_price)}</code>\n"
+    text += f"\n{protection}"
     return text, get_position_actions_menu(symbol, position_idx)
 
 

@@ -12,6 +12,18 @@ from storage.database import get_store
 from telegram_bot.ui import render_callback_screen
 
 router = Router()
+PROFILE_INTERVALS = ("5", "15", "60", "240", "D")
+_INTERVAL_LABELS = {
+    "5": "5 минут",
+    "15": "15 минут",
+    "60": "1 час",
+    "240": "4 часа",
+    "D": "1 день",
+}
+
+
+def _interval_label(value: object) -> str:
+    return _INTERVAL_LABELS.get(str(value), _INTERVAL_LABELS["15"])
 
 
 def profile_markup(user: dict) -> InlineKeyboardMarkup:
@@ -29,7 +41,7 @@ def profile_markup(user: dict) -> InlineKeyboardMarkup:
         *token_rows,
         [
             InlineKeyboardButton(
-                text=f"Интервал: {user.get('default_interval', '15')}м",
+                text=f"Интервал: {_interval_label(user.get('default_interval'))}",
                 callback_data="settings:interval",
             ),
             InlineKeyboardButton(
@@ -45,7 +57,7 @@ def profile_text(user: dict) -> str:
     return (
         "👤 <b>Профиль алертов</b>\n\n"
         f"Актив по умолчанию: <code>{user.get('default_symbol', 'BTC')}</code>\n"
-        f"Интервал графика/RSI: <code>{user.get('default_interval', '15')} мин</code>\n"
+        f"Интервал графика/RSI: <code>{_interval_label(user.get('default_interval'))}</code>\n"
         f"Уведомления: <code>{'включены' if user.get('notifications_enabled') else 'выключены'}</code>\n\n"
         "<i>Торговые лимиты общие для одного биржевого аккаунта; "
         "персональными здесь являются только алерты и отображение.</i>"
@@ -92,13 +104,18 @@ async def set_symbol(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "settings:interval")
 async def cycle_interval(callback: CallbackQuery) -> None:
     user = await asyncio.to_thread(get_store().get_user, callback.message.chat.id)
-    intervals = ["5", "15", "60", "240"]
     current = str(user.get("default_interval", "15"))
-    next_interval = intervals[(intervals.index(current) + 1) % len(intervals)] if current in intervals else "15"
+    next_interval = (
+        PROFILE_INTERVALS[
+            (PROFILE_INTERVALS.index(current) + 1) % len(PROFILE_INTERVALS)
+        ]
+        if current in PROFILE_INTERVALS
+        else "15"
+    )
     await asyncio.to_thread(
         get_store().update_user_settings, callback.message.chat.id, default_interval=next_interval
     )
-    await callback.answer(f"Интервал: {next_interval} мин")
+    await callback.answer(f"Интервал: {_interval_label(next_interval)}")
     await show_profile(callback)
 
 

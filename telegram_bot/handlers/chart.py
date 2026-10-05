@@ -9,12 +9,23 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from api.bybit_api import BybitAPI
 from config import TRADABLE_TOKENS
-from core.chart import RICH_MEDIA_ID, build_chart_payload
+from core.chart import (
+    CHART_REFRESH_SECONDS,
+    RICH_MEDIA_ID,
+    build_chart_payload,
+)
 from storage.database import get_store
 from telegram_bot.ui import RichPhotoScreen, render_rich_live_screen
 
 router = Router()
-INTERVALS = ("5", "15", "60", "240")
+INTERVAL_LABELS = {
+    "5": "5м",
+    "15": "15м",
+    "60": "1ч",
+    "240": "4ч",
+    "D": "1д",
+}
+INTERVALS = tuple(INTERVAL_LABELS)
 
 
 def chart_markup(symbol: str, interval: str) -> InlineKeyboardMarkup:
@@ -27,10 +38,10 @@ def chart_markup(symbol: str, interval: str) -> InlineKeyboardMarkup:
     ]
     interval_buttons = [
         InlineKeyboardButton(
-            text=("• " if value == interval else "") + label,
+            text=("• " if value == interval else "") + INTERVAL_LABELS[value],
             callback_data=f"chart:interval:{value}",
         )
-        for value, label in zip(INTERVALS, ("5м", "15м", "1ч", "4ч"))
+        for value in INTERVALS
     ]
     rows = [token_buttons[index : index + 3] for index in range(0, len(token_buttons), 3)]
     rows.extend(
@@ -81,7 +92,7 @@ async def show_chart(callback: CallbackQuery) -> None:
     await render_rich_live_screen(
         callback.message,
         loader,
-        interval_seconds=30,
+        interval_seconds=CHART_REFRESH_SECONDS,
     )
 
 
@@ -123,5 +134,5 @@ async def select_chart_interval(callback: CallbackQuery):
         callback.message.chat.id,
         default_interval=interval,
     )
-    await callback.answer("Интервал обновлён")
+    await callback.answer(f"Таймфрейм: {INTERVAL_LABELS[interval]}")
     await show_chart(callback)
